@@ -10,6 +10,8 @@ export class LocalStorageConfigAdapter implements ConfigStorageAdapter {
             const envConfig = {
                 cmsAdapter: import.meta.env.VITE_CMS_ADAPTER || undefined,
                 cmsAdapterUrl: import.meta.env.VITE_CMS_ADAPTER_URL || undefined,
+                backendBaseUrl: import.meta.env.VITE_BACKEND_BASE_URL || undefined,
+                defaultPairingCode: import.meta.env.VITE_DEFAULT_PAIRING_CODE || undefined,
                 timezone: import.meta.env.VITE_TIMEZONE || undefined,
                 playbackTrackerEnabled: import.meta.env.VITE_ENABLE_PLAYBACK_TRACKER === 'true' ? true : undefined
             }
@@ -22,6 +24,12 @@ export class LocalStorageConfigAdapter implements ConfigStorageAdapter {
             // Get stored config
             const storedConfig = localStorage.getItem(CONFIG_STORAGE_KEY)
             const parsedStoredConfig: Partial<ConfigData> = storedConfig ? JSON.parse(storedConfig) : {}
+
+            // Migrate legacy startup behavior to Screenlite pairing flow.
+            if (!import.meta.env.VITE_CMS_ADAPTER && parsedStoredConfig.cmsAdapter === 'NetworkFile') {
+                parsedStoredConfig.cmsAdapter = 'Screenlite'
+                parsedStoredConfig.cmsAdapterUrl = ''
+            }
 
             // Merge in order: defaults <- env <- stored (user settings)
             // This allows user settings to override environment variables

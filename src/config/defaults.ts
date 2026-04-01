@@ -1,6 +1,8 @@
 export const DEFAULT_CONFIG = {
-    cmsAdapter: 'NetworkFile',
+    cmsAdapter: 'Screenlite',
     cmsAdapterUrl: '',
+    backendBaseUrl: '',
+    defaultPairingCode: '',
     timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
     playbackTrackerEnabled: false
 } as const

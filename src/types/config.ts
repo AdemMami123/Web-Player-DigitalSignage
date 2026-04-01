@@ -1,6 +1,8 @@
 export interface ConfigData {
     cmsAdapter: string
     cmsAdapterUrl: string
+    backendBaseUrl: string
+    defaultPairingCode: string
     timezone: string
     playbackTrackerEnabled: boolean
 }

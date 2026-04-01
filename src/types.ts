@@ -56,6 +56,13 @@ export type CMSAdapter = {
   onUpdate(callback: (state: any) => void): void;
 }
 
+export type PairableCMSAdapter = CMSAdapter & {
+	pair(pairingCode?: string): Promise<boolean>;
+	unpair(): void;
+	onConnectionStatusChange(callback: (status: string) => void): void;
+	getConnectionStatus(): string;
+}
+
 export type DeviceTelemetry = {
 	localIpAddress: string;
 	macAddress: string;

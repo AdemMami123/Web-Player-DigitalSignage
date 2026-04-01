@@ -5,6 +5,8 @@ import { cacheService } from './services/cacheService'
 import { getCMSAdapter } from './utils/getCMSAdapter'
 import { Player } from './renderer/Player'
 import { ConfigOverlay } from './renderer/ConfigOverlay'
+import { PairingTestPanel } from './renderer/PairingTestPanel'
+import { PairingSuccessDemoScreen } from './renderer/PairingSuccessDemoScreen'
 import { FPSDisplay } from './renderer/FPSDisplay'
 import type { Playlist } from './types'
 
@@ -12,6 +14,8 @@ export class App {
     private root: HTMLElement
     private player: Player
     private configOverlay: ConfigOverlay
+    private pairingTestPanel: PairingTestPanel
+    private pairingSuccessDemoScreen: PairingSuccessDemoScreen
     private fpsDisplay: FPSDisplay
     private statusEl: HTMLDivElement
 
@@ -20,6 +24,7 @@ export class App {
     private currentTimestamp: number
     private lastSecond = -1
     private timestampInterval = 0
+    private unsubscribeConnectionStatus: (() => void) | null = null
 
     constructor(root: HTMLElement) {
         this.root = root
@@ -27,15 +32,20 @@ export class App {
 
         this.player = new Player()
         this.configOverlay = new ConfigOverlay()
+        this.pairingTestPanel = new PairingTestPanel()
+        this.pairingSuccessDemoScreen = new PairingSuccessDemoScreen()
         this.fpsDisplay = new FPSDisplay()
         this.statusEl = this.buildStatusEl()
     }
 
     async init(): Promise<void> {
         await configStore.loadConfig()
+        await this.clearLegacyPlaybackCacheIfScreenlite()
 
         // Mount UI
         this.configOverlay.mount(this.root)
+        this.pairingTestPanel.mount(this.root)
+        this.pairingSuccessDemoScreen.mount(this.root)
         this.fpsDisplay.mount(this.root)
 
         // Wire cache service
@@ -53,18 +63,30 @@ export class App {
         cmsService.onUpdate = (playlists) => {
             cacheService.processPlaylists(playlists)
         }
+        this.unsubscribeConnectionStatus = cmsService.subscribeConnectionStatus(() => {
+            this.render()
+        })
 
         // Connect to CMS
         this.connectCMS()
 
-        // React to config changes (adapter URL/type change → reconnect)
+        // React to config changes (adapter settings change → reconnect)
         let prevAdapter = configStore.state.config.cmsAdapter
         let prevUrl = configStore.state.config.cmsAdapterUrl
+        let prevBackendBaseUrl = configStore.state.config.backendBaseUrl
+        let prevDefaultPairingCode = configStore.state.config.defaultPairingCode
 
         configStore.subscribe(state => {
-            if (state.config.cmsAdapter !== prevAdapter || state.config.cmsAdapterUrl !== prevUrl) {
+            if (
+                state.config.cmsAdapter !== prevAdapter ||
+                state.config.cmsAdapterUrl !== prevUrl ||
+                state.config.backendBaseUrl !== prevBackendBaseUrl ||
+                state.config.defaultPairingCode !== prevDefaultPairingCode
+            ) {
                 prevAdapter = state.config.cmsAdapter
                 prevUrl = state.config.cmsAdapterUrl
+                prevBackendBaseUrl = state.config.backendBaseUrl
+                prevDefaultPairingCode = state.config.defaultPairingCode
                 this.connectCMS()
             }
         })
@@ -81,9 +103,21 @@ export class App {
     }
 
     private connectCMS(): void {
-        const { cmsAdapter, cmsAdapterUrl } = configStore.state.config
-        const adapter = getCMSAdapter(cmsAdapter, cmsAdapterUrl)
+        const config = configStore.state.config
+        const adapter = getCMSAdapter(config.cmsAdapter, config.cmsAdapterUrl, config)
         cmsService.connect(adapter)
+    }
+
+    private async clearLegacyPlaybackCacheIfScreenlite(): Promise<void> {
+        if (configStore.state.config.cmsAdapter !== 'Screenlite') {
+            return
+        }
+
+        localStorage.removeItem('cached_playlists')
+
+        if ('caches' in window) {
+            await caches.delete('media-cache-v1')
+        }
     }
 
     private updateTimestamp(): void {
@@ -101,6 +135,22 @@ export class App {
     }
 
     private render(): void {
+        if (this.shouldBlockPlaybackForPairing()) {
+            this.pairingSuccessDemoScreen.hide()
+            this.showStatus('Waiting for pairing...')
+            return
+        }
+
+        if (this.shouldShowPairingSuccessDemo()) {
+            this.player.el.remove()
+            this.statusEl.remove()
+            this.pairingSuccessDemoScreen.updateTime(this.currentTimestamp)
+            this.pairingSuccessDemoScreen.show()
+            return
+        }
+
+        this.pairingSuccessDemoScreen.hide()
+
         if (this.cachedPlaylists.length > 0) {
             this.showPlayer()
             this.player.update(this.cachedPlaylists, this.currentTimestamp)
@@ -109,6 +159,25 @@ export class App {
         } else {
             this.showStatus('Schedule is empty')
         }
+    }
+
+    private shouldBlockPlaybackForPairing(): boolean {
+        const config = configStore.state.config
+        if (config.cmsAdapter !== 'Screenlite') {
+            return false
+        }
+
+        return cmsService.getConnectionStatus() !== 'connected'
+    }
+
+    private shouldShowPairingSuccessDemo(): boolean {
+        const config = configStore.state.config
+        if (config.cmsAdapter !== 'Screenlite') {
+            return false
+        }
+
+        const isConnected = cmsService.getConnectionStatus() === 'connected'
+        return isConnected && !this.isCaching && this.cachedPlaylists.length === 0
     }
 
     private showPlayer(): void {
@@ -144,7 +213,10 @@ export class App {
         clearInterval(this.timestampInterval)
         tickLoop.stop()
         cmsService.disconnect()
+        this.unsubscribeConnectionStatus?.()
         this.configOverlay.destroy()
+        this.pairingTestPanel.destroy()
+        this.pairingSuccessDemoScreen.destroy()
     }
 }
 

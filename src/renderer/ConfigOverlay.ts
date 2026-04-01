@@ -1,5 +1,6 @@
 import type { ConfigData } from '../types/config'
 import { configStore } from '../store/configStore'
+import { cmsService } from '../services/cmsService'
 
 function el<K extends keyof HTMLElementTagNameMap>(
     tag: K,
@@ -26,6 +27,10 @@ export class ConfigOverlay {
     el: HTMLDivElement
     private formData: ConfigData
     private inputs: Record<string, HTMLInputElement | HTMLSelectElement> = {}
+    private screenliteControls: HTMLDivElement | null = null
+    private connectionStatusEl: HTMLParagraphElement | null = null
+    private connectionStatus = 'disconnected'
+    private unsubscribeStatus: (() => void) | null = null
     private unsubscribe: (() => void) | null = null
 
     constructor() {
@@ -40,6 +45,12 @@ export class ConfigOverlay {
                 this.formData = { ...state.config }
                 this.syncInputsFromFormData()
             }
+        })
+
+        this.connectionStatus = cmsService.getConnectionStatus()
+        this.unsubscribeStatus = cmsService.subscribeConnectionStatus((status) => {
+            this.connectionStatus = status
+            this.renderConnectionStatus()
         })
 
         window.addEventListener('keydown', this.handleKeydown)
@@ -113,8 +124,13 @@ export class ConfigOverlay {
             { value: 'ScreenlitePlayground', label: 'Screenlite Playground' }
         ]))
         form.appendChild(this.buildTextField('cmsAdapterUrl', 'CMS Adapter URL'))
+        form.appendChild(this.buildTextField('backendBaseUrl', 'Backend Base URL'))
+        form.appendChild(this.buildTextField('defaultPairingCode', 'Default Pairing Code'))
         form.appendChild(this.buildTextField('timezone', 'Timezone'))
         form.appendChild(this.buildCheckboxField('playbackTrackerEnabled', 'Enable Playback Tracker'))
+
+        this.screenliteControls = this.buildScreenliteControls()
+        form.appendChild(this.screenliteControls)
 
         const actions = document.createElement('div')
         Object.assign(actions.style, { marginTop: '24px', display: 'flex', justifyContent: 'flex-end', gap: '12px' })
@@ -142,6 +158,8 @@ export class ConfigOverlay {
         inner.appendChild(form)
         card.appendChild(inner)
         this.el.appendChild(card)
+        this.updateScreenliteControlsVisibility()
+        this.renderConnectionStatus()
     }
 
     private buildTextField(name: keyof ConfigData, label: string): HTMLDivElement {
@@ -198,6 +216,9 @@ export class ConfigOverlay {
         select.value = String(this.formData[name] ?? '')
         select.addEventListener('change', () => {
             (this.formData as unknown as Record<string, unknown>)[name] = select.value
+            if (name === 'cmsAdapter') {
+                this.updateScreenliteControlsVisibility()
+            }
         })
 
         this.inputs[name] = select
@@ -242,6 +263,117 @@ export class ConfigOverlay {
                 inputEl.value = String(this.formData[key] ?? '')
             }
         }
+        this.updateScreenliteControlsVisibility()
+        this.renderConnectionStatus()
+    }
+
+    private buildScreenliteControls(): HTMLDivElement {
+        const wrap = document.createElement('div')
+        Object.assign(wrap.style, {
+            marginBottom: '16px',
+            border: '1px solid #D1D5DB',
+            borderRadius: '6px',
+            padding: '12px',
+            background: '#F9FAFB',
+        })
+
+        const title = document.createElement('p')
+        title.textContent = 'Screenlite Pairing'
+        Object.assign(title.style, {
+            margin: '0 0 8px 0',
+            fontSize: '0.875rem',
+            fontWeight: '600',
+            color: '#111827',
+        })
+
+        this.connectionStatusEl = document.createElement('p')
+        Object.assign(this.connectionStatusEl.style, {
+            margin: '0 0 12px 0',
+            fontSize: '0.8125rem',
+            color: '#374151',
+        })
+
+        const actions = document.createElement('div')
+        Object.assign(actions.style, {
+            display: 'flex',
+            gap: '8px',
+            flexWrap: 'wrap',
+        })
+
+        const pairButton = el('button', { type: 'button' }, ['Pair'])
+        Object.assign(pairButton.style, {
+            padding: '6px 12px',
+            fontSize: '0.8125rem',
+            fontWeight: '600',
+            color: 'white',
+            background: '#2563EB',
+            border: 'none',
+            borderRadius: '6px',
+            cursor: 'pointer',
+        })
+        pairButton.addEventListener('click', async () => {
+            const pairingCode = (this.formData.defaultPairingCode || '').trim()
+            await configStore.updateConfig({ defaultPairingCode: pairingCode })
+            const ok = await cmsService.pair(pairingCode)
+            if (!ok) {
+                this.connectionStatus = 'error'
+                this.renderConnectionStatus('Pair request failed. Verify backend URL and pairing code.')
+                return
+            }
+            this.renderConnectionStatus('Pair request succeeded.')
+        })
+
+        const unpairButton = el('button', { type: 'button' }, ['Unpair'])
+        Object.assign(unpairButton.style, {
+            padding: '6px 12px',
+            fontSize: '0.8125rem',
+            fontWeight: '600',
+            color: '#111827',
+            background: '#E5E7EB',
+            border: 'none',
+            borderRadius: '6px',
+            cursor: 'pointer',
+        })
+        unpairButton.addEventListener('click', () => {
+            cmsService.unpair()
+            this.connectionStatus = 'waiting_for_pairing'
+            this.renderConnectionStatus('Device unpaired.')
+        })
+
+        actions.appendChild(pairButton)
+        actions.appendChild(unpairButton)
+
+        wrap.appendChild(title)
+        wrap.appendChild(this.connectionStatusEl)
+        wrap.appendChild(actions)
+
+        return wrap
+    }
+
+    private updateScreenliteControlsVisibility(): void {
+        if (!this.screenliteControls) {
+            return
+        }
+
+        this.screenliteControls.style.display = this.formData.cmsAdapter === 'Screenlite' ? 'block' : 'none'
+    }
+
+    private renderConnectionStatus(extraMessage?: string): void {
+        if (!this.connectionStatusEl) {
+            return
+        }
+
+        const normalized = this.connectionStatus.replace(/_/g, ' ')
+        const suffix = extraMessage ? ` - ${extraMessage}` : ''
+        this.connectionStatusEl.textContent = `Status: ${normalized}${suffix}`
+
+        if (this.connectionStatus === 'connected') {
+            this.connectionStatusEl.style.color = '#166534'
+        } else if (this.connectionStatus === 'offline' || this.connectionStatus === 'error' || this.connectionStatus === 'unauthorized') {
+            this.connectionStatusEl.style.color = '#B91C1C'
+        } else {
+            this.connectionStatusEl.style.color = '#374151'
+        }
     }
 
     private handleSubmit = async (e: Event): Promise<void> => {
@@ -256,6 +388,7 @@ export class ConfigOverlay {
 
     destroy(): void {
         this.unsubscribe?.()
+        this.unsubscribeStatus?.()
         window.removeEventListener('keydown', this.handleKeydown)
         this.el.remove()
     }
