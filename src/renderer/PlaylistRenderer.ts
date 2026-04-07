@@ -24,6 +24,7 @@ export class PlaylistRenderer {
 
     update(playlist: Playlist, elapsedSinceStart: number, scale: number): void {
         this.elapsedDisplay.update(elapsedSinceStart / 1000)
+        this.canvas.style.background = playlist.background?.trim() || 'black'
 
         const ids = new Set<string>()
         for (const section of playlist.sections) {

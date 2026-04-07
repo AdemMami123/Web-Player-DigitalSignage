@@ -6,7 +6,6 @@ import { getCMSAdapter } from './utils/getCMSAdapter'
 import { Player } from './renderer/Player'
 import { ConfigOverlay } from './renderer/ConfigOverlay'
 import { PairingTestPanel } from './renderer/PairingTestPanel'
-import { PairingSuccessDemoScreen } from './renderer/PairingSuccessDemoScreen'
 import { FPSDisplay } from './renderer/FPSDisplay'
 import type { Playlist } from './types'
 
@@ -15,7 +14,6 @@ export class App {
     private player: Player
     private configOverlay: ConfigOverlay
     private pairingTestPanel: PairingTestPanel
-    private pairingSuccessDemoScreen: PairingSuccessDemoScreen
     private fpsDisplay: FPSDisplay
     private statusEl: HTMLDivElement
 
@@ -33,7 +31,6 @@ export class App {
         this.player = new Player()
         this.configOverlay = new ConfigOverlay()
         this.pairingTestPanel = new PairingTestPanel()
-        this.pairingSuccessDemoScreen = new PairingSuccessDemoScreen()
         this.fpsDisplay = new FPSDisplay()
         this.statusEl = this.buildStatusEl()
     }
@@ -45,7 +42,6 @@ export class App {
         // Mount UI
         this.configOverlay.mount(this.root)
         this.pairingTestPanel.mount(this.root)
-        this.pairingSuccessDemoScreen.mount(this.root)
         this.fpsDisplay.mount(this.root)
 
         // Wire cache service
@@ -136,20 +132,9 @@ export class App {
 
     private render(): void {
         if (this.shouldBlockPlaybackForPairing()) {
-            this.pairingSuccessDemoScreen.hide()
             this.showStatus('Waiting for pairing...')
             return
         }
-
-        if (this.shouldShowPairingSuccessDemo()) {
-            this.player.el.remove()
-            this.statusEl.remove()
-            this.pairingSuccessDemoScreen.updateTime(this.currentTimestamp)
-            this.pairingSuccessDemoScreen.show()
-            return
-        }
-
-        this.pairingSuccessDemoScreen.hide()
 
         if (this.cachedPlaylists.length > 0) {
             this.showPlayer()
@@ -157,7 +142,11 @@ export class App {
         } else if (this.isCaching) {
             this.showStatus('Loading...')
         } else {
-            this.showStatus('Schedule is empty')
+            const emptyMessage =
+                configStore.state.config.cmsAdapter === 'Screenlite'
+                    ? 'No template assigned'
+                    : 'Schedule is empty'
+            this.showStatus(emptyMessage)
         }
     }
 
@@ -168,16 +157,6 @@ export class App {
         }
 
         return cmsService.getConnectionStatus() !== 'connected'
-    }
-
-    private shouldShowPairingSuccessDemo(): boolean {
-        const config = configStore.state.config
-        if (config.cmsAdapter !== 'Screenlite') {
-            return false
-        }
-
-        const isConnected = cmsService.getConnectionStatus() === 'connected'
-        return isConnected && !this.isCaching && this.cachedPlaylists.length === 0
     }
 
     private showPlayer(): void {
@@ -216,7 +195,6 @@ export class App {
         this.unsubscribeConnectionStatus?.()
         this.configOverlay.destroy()
         this.pairingTestPanel.destroy()
-        this.pairingSuccessDemoScreen.destroy()
     }
 }
 

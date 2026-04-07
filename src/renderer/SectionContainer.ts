@@ -9,6 +9,7 @@ export class SectionContainer {
     private mediaItems: MediaItem[] = []
     private totalDuration = 0
     private lastItemIds = ''
+    private failedItemIds = new Set<string>()
 
     constructor() {
         this.el = document.createElement('div')
@@ -26,7 +27,8 @@ export class SectionContainer {
         this.syncItems(section)
 
         const sequenceState = calculateMediaSequenceState(this.mediaItems, elapsedSinceStart, this.totalDuration)
-        this.mediaItems = updateMediaItemsState(this.mediaItems, sequenceState)
+        const timelineItems = updateMediaItemsState(this.mediaItems, sequenceState)
+        this.mediaItems = this.applyFailureAwareState(timelineItems, sequenceState.currentIndex)
 
         const activeIds = new Set<string>()
         for (const item of this.mediaItems) {
@@ -43,7 +45,9 @@ export class SectionContainer {
             if (this.renderers.has(item.id)) {
                 this.renderers.get(item.id)!.update(item)
             } else {
-                const renderer = new MediaItemRenderer(item)
+                const renderer = new MediaItemRenderer(item, (itemId, error) => {
+                    this.handleMediaFailure(itemId, error)
+                })
                 renderer.mount(this.el)
                 this.renderers.set(item.id, renderer)
             }
@@ -61,6 +65,7 @@ export class SectionContainer {
         const newIds = section.items.map(i => i.id).join(',')
         if (newIds === this.lastItemIds) return
         this.lastItemIds = newIds
+        this.failedItemIds.clear()
 
         let items: MediaItem[] = section.items.map(item => ({
             id: item.id,
@@ -82,6 +87,74 @@ export class SectionContainer {
             renderer.unmount()
         }
         this.renderers.clear()
+    }
+
+    private applyFailureAwareState(items: MediaItem[], currentIndex: number): MediaItem[] {
+        if (items.length === 0 || this.failedItemIds.size === 0) {
+            return items
+        }
+
+        const failedIndexes = new Set<number>()
+        for (let i = 0; i < items.length; i++) {
+            if (this.failedItemIds.has(items[i].id)) {
+                failedIndexes.add(i)
+            }
+        }
+
+        if (failedIndexes.size === 0) {
+            return items
+        }
+
+        const currentPlayable = this.findNextPlayableIndex(items, currentIndex, failedIndexes)
+        if (currentPlayable === null) {
+            return items.map(item => ({
+                ...item,
+                hidden: true,
+                preload: false,
+            }))
+        }
+
+        const preloadPlayable = this.findNextPlayableIndex(items, currentPlayable + 1, failedIndexes)
+
+        return items.map((item, index) => ({
+            ...item,
+            hidden: index !== currentPlayable,
+            preload: preloadPlayable !== null && index === preloadPlayable,
+        }))
+    }
+
+    private findNextPlayableIndex(
+        items: MediaItem[],
+        startIndex: number,
+        failedIndexes: Set<number>,
+    ): number | null {
+        if (items.length === 0) {
+            return null
+        }
+
+        const normalizedStart = ((startIndex % items.length) + items.length) % items.length
+        for (let offset = 0; offset < items.length; offset++) {
+            const idx = (normalizedStart + offset) % items.length
+            if (!failedIndexes.has(idx)) {
+                return idx
+            }
+        }
+
+        return null
+    }
+
+    private handleMediaFailure(itemId: string, error: string): void {
+        if (this.failedItemIds.has(itemId)) {
+            return
+        }
+
+        this.failedItemIds.add(itemId)
+        console.error('SectionContainer: media item failed, skipping item', { itemId, error })
+
+        if (this.renderers.has(itemId)) {
+            this.renderers.get(itemId)!.unmount()
+            this.renderers.delete(itemId)
+        }
     }
 
     mount(parent: HTMLElement): void {

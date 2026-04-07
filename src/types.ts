@@ -6,6 +6,7 @@ export type Playlist = {
 	end_time: string
 	width: number
 	height: number
+	background?: string
 	sections: Section[]
 }
 
