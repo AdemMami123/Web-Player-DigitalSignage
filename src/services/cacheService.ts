@@ -22,10 +22,12 @@ function extractMediaItems(playlists: Playlist[]): { url: string; type: 'image' 
     playlists.forEach(playlist => {
         playlist.sections?.forEach(section => {
             section.items?.forEach(item => {
-                if (item.content_path && item.content_type) {
+                const contentType = String(item.content_type ?? '').toLowerCase()
+                const contentPath = String(item.content_path ?? '').trim()
+                if (contentPath && (contentType === 'image' || contentType === 'video')) {
                     items.push({
-                        url: item.content_path,
-                        type: item.content_type === 'video' ? 'video' : 'image'
+                        url: contentPath,
+                        type: contentType === 'video' ? 'video' : 'image'
                     })
                 }
             })

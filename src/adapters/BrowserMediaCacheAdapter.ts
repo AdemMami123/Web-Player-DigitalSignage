@@ -21,6 +21,22 @@ export class BrowserMediaCacheAdapter implements MediaCacheAdapter {
         }
     }
 
+    private toCacheRequest(url: string): Request | null {
+        try {
+            const parsed = new URL(url, window.location.href)
+            if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+                return null
+            }
+            return new Request(parsed.toString(), { method: 'GET' })
+        } catch {
+            return null
+        }
+    }
+
+    private isInlineMediaUrl(url: string): boolean {
+        return url.startsWith('data:') || url.startsWith('blob:')
+    }
+
     async cacheMedia(items: MediaItem[], signal?: AbortSignal): Promise<Map<string, boolean>> {
         if (!this.cache) {
             throw new Error('Cache not available')
@@ -34,12 +50,31 @@ export class BrowserMediaCacheAdapter implements MediaCacheAdapter {
             }
 
             try {
-                const response = await fetch(item.url, { signal })
-                if (response.ok) {
-                    await this.cache.put(item.url, response.clone())
-                    results.set(item.url, true)
-                } else {
+                const url = String(item.url ?? '')
+                if (!url) {
                     results.set(item.url, false)
+                    continue
+                }
+
+                if (this.isInlineMediaUrl(url)) {
+                    // Inline media is already self-contained and should not be persisted via Cache API.
+                    results.set(url, true)
+                    continue
+                }
+
+                const request = this.toCacheRequest(url)
+                if (!request) {
+                    // Unsupported schemes (for example file:) are treated as non-cacheable but usable.
+                    results.set(url, true)
+                    continue
+                }
+
+                const response = await fetch(request, { signal })
+                if (response.ok) {
+                    await this.cache.put(request, response.clone())
+                    results.set(url, true)
+                } else {
+                    results.set(url, false)
                 }
             } catch (error) {
                 results.set(item.url, false)
@@ -55,7 +90,16 @@ export class BrowserMediaCacheAdapter implements MediaCacheAdapter {
             return null
         }
 
-        const response = await this.cache.match(url)
+        if (this.isInlineMediaUrl(url)) {
+            return url
+        }
+
+        const request = this.toCacheRequest(url)
+        if (!request) {
+            return url
+        }
+
+        const response = await this.cache.match(request)
         if (response) {
             return url
         }
@@ -74,7 +118,11 @@ export class BrowserMediaCacheAdapter implements MediaCacheAdapter {
             return
         }
 
-        const urlSet = new Set(currentUrls)
+        const urlSet = new Set(
+            currentUrls
+                .map(url => this.toCacheRequest(url)?.url)
+                .filter((value): value is string => Boolean(value))
+        )
         const keys = await this.cache.keys()
         
         for (const request of keys) {
