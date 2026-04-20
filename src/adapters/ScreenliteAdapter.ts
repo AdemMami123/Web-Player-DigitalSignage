@@ -1,16 +1,22 @@
+import { Client } from '@stomp/stompjs'
+import SockJS from 'sockjs-client'
 import type { CMSAdapter, PairableCMSAdapter, Playlist } from '../types'
-import { getDeviceTelemetry } from '../utils/getDeviceTelemetry'
-import { ScreenlitePlayerApiClient } from './ScreenlitePlayerApiClient'
 import type {
     PairConsumeRequest,
+    PlayerContentSyncPayload,
     PlayerPairConsumeResponse,
     PlayerPlaylistDto,
     PlayerScheduleResponse,
+    PlayerScreenStatusPayload,
     PlayerTemplateDto,
     PlayerTemplateElementDto,
     PlayerTemplateLayoutDto,
     PlayerTemplateResponse,
+    PlayerWsUpdateEvent,
 } from '../types/screenliteApi'
+import { getDeviceTelemetry } from '../utils/getDeviceTelemetry'
+import { runtimeClock } from '../services/runtimeClock'
+import { ScreenlitePlayerApiClient } from './ScreenlitePlayerApiClient'
 
 const TOKEN_STORAGE_KEY = 'screenlite_device_token'
 const LINKED_DEVICE_STORAGE_KEY = 'screenlite_linked_device'
@@ -39,25 +45,26 @@ export class ScreenliteAdapter implements CMSAdapter, PairableCMSAdapter {
     private linkedDevice: LinkedDeviceInfo | null
     private connected = false
     private heartbeatTimeoutId: ReturnType<typeof setTimeout> | null = null
-    private scheduleTimeoutId: ReturnType<typeof setTimeout> | null = null
     private readonly heartbeatIntervalMs = 30000
     private readonly heartbeatBackoffMs = [5000, 10000, 20000, 40000, 60000] as const
-    private readonly schedulePollIntervalMs = 60000
+    private readonly websocketReconnectDelayMs = 5000
     private readonly requestTimeoutMs = 10000
     private heartbeatFailureCount = 0
     private heartbeatInFlight = false
-    private scheduleInFlight = false
-    private pendingImmediateSchedulePoll = false
+    private bootstrapInFlight = false
     private lastTemplateSignature: string | null = null
+    private stompClient: Client | null = null
+    private latestTemplateByScreenId = new Map<string, PlayerTemplateDto>()
+    private latestScheduleByScreenId = new Map<string, PlayerScheduleResponse | PlayerPlaylistDto[]>()
     private lifecycleId = 0
     private resumeListenerAttached = false
     private readonly onVisibilityChange = () => {
         if (document.visibilityState === 'visible') {
-            this.requestImmediateSchedulePoll()
+            this.requestImmediateBootstrap()
         }
     }
     private readonly onOnline = () => {
-        this.requestImmediateSchedulePoll()
+        this.requestImmediateBootstrap()
     }
     private status: ConnectionStatus = 'disconnected'
     private statusCallback: ((status: string) => void) | null = null
@@ -92,6 +99,7 @@ export class ScreenliteAdapter implements CMSAdapter, PairableCMSAdapter {
 
     async pair(pairingCode?: string): Promise<boolean> {
         const code = (pairingCode ?? this.defaultPairingCode).trim()
+
         if (!code) {
             console.warn('ScreenliteAdapter: Pairing code is required')
             this.updateStatus('waiting_for_pairing')
@@ -161,6 +169,7 @@ export class ScreenliteAdapter implements CMSAdapter, PairableCMSAdapter {
 
     unpair(): void {
         this.stopLoops()
+        this.disconnectWebSocket()
         this.clearStoredLink()
         this.updateStatus('waiting_for_pairing')
     }
@@ -169,6 +178,7 @@ export class ScreenliteAdapter implements CMSAdapter, PairableCMSAdapter {
         this.lifecycleId += 1
         this.connected = false
         this.stopLoops()
+        this.disconnectWebSocket()
         this.detachResumeAndReconnectListeners()
         this.updateStatus('disconnected')
     }
@@ -193,9 +203,11 @@ export class ScreenliteAdapter implements CMSAdapter, PairableCMSAdapter {
         }
 
         this.stopLoops()
+        this.disconnectWebSocket()
         this.heartbeatFailureCount = 0
 
         const heartbeatOk = await this.sendHeartbeatOnce()
+
         if (!this.connected || lifecycleId !== this.lifecycleId) {
             return
         }
@@ -205,34 +217,16 @@ export class ScreenliteAdapter implements CMSAdapter, PairableCMSAdapter {
             return
         }
 
-        const templateOk = await this.pollTemplateOnce()
+        const bootstrapOk = await this.runFullBootstrapOnce()
+
         if (!this.connected || lifecycleId !== this.lifecycleId) {
-            return
-        }
-
-        if (!templateOk) {
-            this.updateStatus('offline')
-            this.scheduleNextHeartbeat(this.getHeartbeatRetryDelay())
-            this.scheduleNextPoll(0)
-            return
-        }
-
-        const scheduleOk = await this.pollScheduleOnce()
-        if (!this.connected || lifecycleId !== this.lifecycleId) {
-            return
-        }
-
-        if (!scheduleOk) {
-            this.updateStatus('offline')
-            this.scheduleNextHeartbeat(this.getHeartbeatRetryDelay())
-            this.scheduleNextPoll(0)
             return
         }
 
         this.heartbeatFailureCount = 0
-        this.updateStatus('connected')
+        this.connectWebSocket(lifecycleId)
+        this.updateStatus(bootstrapOk ? 'connected' : 'offline')
         this.scheduleNextHeartbeat(this.heartbeatIntervalMs)
-        this.scheduleNextPoll(this.schedulePollIntervalMs)
     }
 
     private stopLoops(): void {
@@ -240,13 +234,8 @@ export class ScreenliteAdapter implements CMSAdapter, PairableCMSAdapter {
             clearTimeout(this.heartbeatTimeoutId)
             this.heartbeatTimeoutId = null
         }
-        if (this.scheduleTimeoutId !== null) {
-            clearTimeout(this.scheduleTimeoutId)
-            this.scheduleTimeoutId = null
-        }
         this.heartbeatInFlight = false
-        this.scheduleInFlight = false
-        this.pendingImmediateSchedulePoll = false
+        this.bootstrapInFlight = false
     }
 
     private scheduleNextHeartbeat(delayMs: number): void {
@@ -270,6 +259,7 @@ export class ScreenliteAdapter implements CMSAdapter, PairableCMSAdapter {
 
         this.heartbeatInFlight = true
         const ok = await this.sendHeartbeatOnce()
+
         this.heartbeatInFlight = false
 
         if (!this.connected) {
@@ -290,6 +280,7 @@ export class ScreenliteAdapter implements CMSAdapter, PairableCMSAdapter {
 
     private getHeartbeatRetryDelay(): number {
         const index = Math.min(this.heartbeatFailureCount, this.heartbeatBackoffMs.length - 1)
+
         return this.heartbeatBackoffMs[index]
     }
 
@@ -316,46 +307,14 @@ export class ScreenliteAdapter implements CMSAdapter, PairableCMSAdapter {
         return false
     }
 
-    private async runScheduleCycle(): Promise<void> {
+    private async fetchScheduleOnce(): Promise<PlayerScheduleResponse | PlayerPlaylistDto[] | null> {
         if (!this.connected) {
-            return
-        }
-
-        if (this.scheduleInFlight) {
-            this.pendingImmediateSchedulePoll = true
-            return
-        }
-
-        this.scheduleInFlight = true
-        const templateOk = await this.pollTemplateOnce()
-        const scheduleOk = await this.pollScheduleOnce()
-        this.scheduleInFlight = false
-
-        if (!this.connected) {
-            return
-        }
-
-        if ((!templateOk || !scheduleOk) && this.status !== 'unauthorized') {
-            this.updateStatus('offline')
-        }
-
-        if (this.pendingImmediateSchedulePoll) {
-            this.pendingImmediateSchedulePoll = false
-            this.scheduleNextPoll(0)
-            return
-        }
-
-        this.scheduleNextPoll(this.schedulePollIntervalMs)
-    }
-
-    private async pollScheduleOnce(): Promise<boolean> {
-        if (!this.connected) {
-            return false
+            return null
         }
 
         if (!this.token) {
             this.updateStatus('waiting_for_pairing')
-            return false
+            return null
         }
 
         const response = await this.apiClient.getSchedule(this.token, this.getLinkedScreenId() ?? undefined)
@@ -363,30 +322,25 @@ export class ScreenliteAdapter implements CMSAdapter, PairableCMSAdapter {
         if (response.unauthorized) {
             console.warn('ScreenliteAdapter: Schedule request unauthorized, clearing device token')
             this.handleUnauthorized()
-            return false
+            return null
         }
 
         if (response.ok && response.data) {
-            const playlists = this.extractPlaylists(response.data)
-            if (playlists) {
-                return true
-            }
-
-            return false
-        } else {
-            console.warn('ScreenliteAdapter: Schedule poll failed, keeping previous schedule', response.error)
-            return false
+            return response.data
         }
+
+        console.warn('ScreenliteAdapter: Schedule bootstrap failed, keeping previous state', response.error)
+        return null
     }
 
-    private async pollTemplateOnce(): Promise<boolean> {
+    private async fetchTemplatesOnce(): Promise<PlayerTemplateDto[] | null> {
         if (!this.connected) {
-            return false
+            return null
         }
 
         if (!this.token) {
             this.updateStatus('waiting_for_pairing')
-            return false
+            return null
         }
 
         const response = await this.apiClient.getTemplates(this.token, this.getLinkedScreenId() ?? undefined)
@@ -394,49 +348,24 @@ export class ScreenliteAdapter implements CMSAdapter, PairableCMSAdapter {
         if (response.unauthorized) {
             console.warn('ScreenliteAdapter: Template request unauthorized, clearing device token')
             this.handleUnauthorized()
-            return false
+            return null
         }
 
         if (!response.ok || !response.data) {
-            console.warn('ScreenliteAdapter: Template poll failed, keeping previous template', response.error)
-            return false
+            console.warn('ScreenliteAdapter: Template bootstrap failed, keeping previous state', response.error)
+            return null
         }
 
-        const templates = this.extractTemplates(response.data)
-        if (templates === null) {
-            return false
-        }
-
-        const playlists = this.normalizeTemplatePlaylists(templates)
-        this.emitTemplateUpdate(playlists)
-        return true
+        return this.extractTemplates(response.data)
     }
 
-    private scheduleNextPoll(delayMs: number = this.schedulePollIntervalMs): void {
-        if (!this.connected) {
-            return
-        }
-
-        if (this.scheduleTimeoutId !== null) {
-            clearTimeout(this.scheduleTimeoutId)
-        }
-
-        this.scheduleTimeoutId = setTimeout(() => {
-            void this.runScheduleCycle()
-        }, delayMs)
-    }
-
-    private requestImmediateSchedulePoll(): void {
+    private requestImmediateBootstrap(): void {
         if (!this.connected || !this.token) {
             return
         }
 
-        if (this.scheduleInFlight) {
-            this.pendingImmediateSchedulePoll = true
-            return
-        }
-
-        this.scheduleNextPoll(0)
+        void this.runFullBootstrapOnce()
+        this.connectWebSocket(this.lifecycleId)
     }
 
     private attachResumeAndReconnectListeners(): void {
@@ -457,6 +386,304 @@ export class ScreenliteAdapter implements CMSAdapter, PairableCMSAdapter {
         document.removeEventListener('visibilitychange', this.onVisibilityChange)
         window.removeEventListener('online', this.onOnline)
         this.resumeListenerAttached = false
+    }
+
+    private connectWebSocket(lifecycleId: number): void {
+        if (!this.connected || lifecycleId !== this.lifecycleId || !this.token) {
+            return
+        }
+
+        if (this.stompClient?.active) {
+            return
+        }
+
+        const deviceId = this.linkedDevice?.deviceId
+
+        if (!deviceId) {
+            console.warn('ScreenliteAdapter: Missing deviceId; cannot subscribe to websocket updates')
+            return
+        }
+
+        const client = new Client({
+            webSocketFactory: () => new SockJS(this.buildSockJsHttpUrl()),
+            connectHeaders: {
+                'X-Device-Token': this.token,
+            },
+            reconnectDelay: this.websocketReconnectDelayMs,
+            heartbeatIncoming: 10000,
+            heartbeatOutgoing: 10000,
+        })
+
+        client.onConnect = () => {
+            if (!this.connected || lifecycleId !== this.lifecycleId) {
+                return
+            }
+
+            const destination = `/topic/player/devices/${deviceId}/updates`
+
+            client.subscribe(destination, message => {
+                this.handleWsMessage(message.body)
+            })
+
+            // Re-run a full REST bootstrap on every websocket reconnect.
+            void this.runFullBootstrapOnce()
+            this.updateStatus('connected')
+        }
+
+        client.onStompError = frame => {
+            console.warn('ScreenliteAdapter: STOMP broker error', frame.headers['message'], frame.body)
+            if (this.status !== 'unauthorized' && this.status !== 'waiting_for_pairing') {
+                this.updateStatus('offline')
+            }
+        }
+
+        client.onWebSocketClose = () => {
+            if (this.connected && this.status !== 'unauthorized' && this.status !== 'waiting_for_pairing') {
+                this.updateStatus('offline')
+            }
+        }
+
+        client.onWebSocketError = event => {
+            console.warn('ScreenliteAdapter: WebSocket transport error', event)
+        }
+
+        this.stompClient = client
+        client.activate()
+    }
+
+    private disconnectWebSocket(): void {
+        const client = this.stompClient
+
+        this.stompClient = null
+        if (client) {
+            void client.deactivate()
+        }
+    }
+
+    private buildSockJsHttpUrl(): string {
+        const parsed = new URL(this.baseUrl)
+        const basePath = parsed.pathname.replace(/\/$/, '')
+
+        return `${parsed.protocol}//${parsed.host}${basePath}/api/ws-player`
+    }
+
+    private handleWsMessage(rawMessage: string): void {
+        try {
+            const event = JSON.parse(rawMessage) as PlayerWsUpdateEvent
+
+            this.applyRuntimeClockSync(event)
+            const type = String(event.type ?? '').toUpperCase()
+
+            if (type === 'CONTENT_SYNC') {
+                this.handleContentSyncEvent(event)
+                return
+            }
+
+            if (type === 'SCREEN_STATUS') {
+                this.handleScreenStatusEvent(event)
+            }
+        } catch (error) {
+            console.warn('ScreenliteAdapter: Failed to parse websocket message', rawMessage, error)
+        }
+    }
+
+    private applyRuntimeClockSync(event: PlayerWsUpdateEvent): void {
+        const payload =
+            event.payload && typeof event.payload === 'object'
+                ? (event.payload as PlayerContentSyncPayload | PlayerScreenStatusPayload)
+                : null
+
+        const serverEpochMs = this.coerceNumber(payload?.serverEpochMs ?? event.serverEpochMs)
+        const recommendedClockTickMs = this.coerceNumber(
+            payload?.recommendedClockTickMs ?? event.recommendedClockTickMs,
+        )
+        const serverTimeZone = this.coerceString(payload?.serverTimeZone ?? event.serverTimeZone)
+
+        runtimeClock.sync(serverEpochMs ?? undefined, recommendedClockTickMs ?? undefined, serverTimeZone ?? undefined)
+    }
+
+    private coerceNumber(value: unknown): number | null {
+        if (typeof value === 'number' && Number.isFinite(value)) {
+            return value
+        }
+
+        if (typeof value === 'string' && value.trim().length > 0) {
+            const parsed = Number(value)
+
+            return Number.isFinite(parsed) ? parsed : null
+        }
+
+        return null
+    }
+
+    private coerceString(value: unknown): string | null {
+        if (typeof value !== 'string') {
+            return null
+        }
+
+        const trimmed = value.trim()
+
+        return trimmed.length > 0 ? trimmed : null
+    }
+
+    private handleContentSyncEvent(event: PlayerWsUpdateEvent): void {
+        const payload =
+            event.payload && typeof event.payload === 'object' ? (event.payload as PlayerContentSyncPayload) : null
+        const incomingTemplate = payload?.template ?? event.template ?? null
+        const incomingSchedule = payload?.schedule ?? event.schedule ?? null
+        const screenId = this.resolveEventScreenId(
+            payload?.screenId ?? event.screenId ?? incomingTemplate?.screenId ?? null,
+        )
+
+        if (!this.shouldProcessScreen(screenId)) {
+            return
+        }
+
+        const screenKey = this.screenMapKey(screenId)
+
+        if (incomingTemplate === null) {
+            this.latestTemplateByScreenId.delete(screenKey)
+        } else if (incomingTemplate) {
+            this.latestTemplateByScreenId.set(screenKey, incomingTemplate)
+        }
+
+        if (incomingSchedule === null) {
+            this.latestScheduleByScreenId.delete(screenKey)
+        } else if (incomingSchedule) {
+            this.latestScheduleByScreenId.set(screenKey, incomingSchedule)
+        }
+
+        const resolvedTemplate = this.latestTemplateByScreenId.get(screenKey) ?? null
+        const resolvedSchedule = this.latestScheduleByScreenId.get(screenKey) ?? null
+
+        this.emitResolvedContent(screenId, resolvedTemplate, resolvedSchedule)
+    }
+
+    private handleScreenStatusEvent(event: PlayerWsUpdateEvent): void {
+        const payload = (event.payload ?? null) as PlayerScreenStatusPayload | null
+
+        if (!payload) {
+            return
+        }
+
+        const screenId = this.resolveEventScreenId(payload.screenId ?? null)
+
+        if (!this.shouldProcessScreen(screenId)) {
+            return
+        }
+
+        const status = String(payload.status ?? '').toLowerCase()
+
+        if (status === 'online' || status === 'heartbeat') {
+            this.updateStatus('connected')
+            return
+        }
+
+        if (status === 'offline') {
+            this.updateStatus('offline')
+        }
+    }
+
+    private async runFullBootstrapOnce(): Promise<boolean> {
+        if (!this.connected || !this.token) {
+            return false
+        }
+
+        if (this.bootstrapInFlight) {
+            return true
+        }
+
+        this.bootstrapInFlight = true
+
+        try {
+            const [templates, schedule] = await Promise.all([this.fetchTemplatesOnce(), this.fetchScheduleOnce()])
+
+            if (!this.connected || !this.token) {
+                return false
+            }
+
+            const activeScreenId = this.getLinkedScreenId()
+            const screenKey = this.screenMapKey(activeScreenId)
+
+            if (Array.isArray(templates)) {
+                const template = this.pickTemplateForScreen(templates, activeScreenId)
+
+                if (template) {
+                    this.latestTemplateByScreenId.set(screenKey, template)
+                }
+            }
+
+            if (schedule) {
+                this.latestScheduleByScreenId.set(screenKey, schedule)
+            }
+
+            const template = this.latestTemplateByScreenId.get(screenKey) ?? null
+            const normalizedSchedule = this.latestScheduleByScreenId.get(screenKey) ?? null
+
+            this.emitResolvedContent(activeScreenId, template, normalizedSchedule)
+
+            return Boolean(template || normalizedSchedule)
+        } finally {
+            this.bootstrapInFlight = false
+        }
+    }
+
+    private emitResolvedContent(
+        screenId: string | null,
+        template: PlayerTemplateDto | null,
+        schedule: PlayerScheduleResponse | PlayerPlaylistDto[] | null,
+    ): void {
+        if (!this.shouldProcessScreen(screenId)) {
+            return
+        }
+
+        const schedulePlaylists = schedule ? this.extractPlaylists(schedule) : null
+
+        if (schedulePlaylists && schedulePlaylists.length > 0) {
+            this.emitTemplateUpdate(schedulePlaylists)
+            return
+        }
+
+        if (template) {
+            this.emitTemplateUpdate(this.normalizeTemplatePlaylists([template]))
+            return
+        }
+
+        this.emitTemplateUpdate([this.buildPlaceholderPlaylist()])
+    }
+
+    private pickTemplateForScreen(templates: PlayerTemplateDto[], screenId: string | null): PlayerTemplateDto | null {
+        if (templates.length === 0) {
+            return null
+        }
+
+        if (!screenId) {
+            return templates[0] ?? null
+        }
+
+        const exact = templates.find(template => this.resolveEventScreenId(template.screenId ?? null) === screenId)
+
+        return exact ?? templates[0] ?? null
+    }
+
+    private resolveEventScreenId(screenId: string | null): string | null {
+        const normalized = String(screenId ?? '').trim()
+
+        return normalized || null
+    }
+
+    private screenMapKey(screenId: string | null): string {
+        return screenId ?? '__default__'
+    }
+
+    private shouldProcessScreen(screenId: string | null): boolean {
+        const mountedScreenId = this.getLinkedScreenId()
+
+        if (!mountedScreenId || !screenId) {
+            return true
+        }
+
+        return mountedScreenId === screenId
     }
 
     private extractPlaylists(payload: PlayerScheduleResponse | PlayerPlaylistDto[]): Playlist[] | null {
@@ -485,6 +712,7 @@ export class ScreenliteAdapter implements CMSAdapter, PairableCMSAdapter {
         if (payload && typeof payload === 'object') {
             const body = payload as Exclude<PlayerTemplateResponse, PlayerTemplateDto[]>
             const candidate = body.templates ?? body.data?.templates
+
             if (Array.isArray(candidate)) {
                 return candidate
             }
@@ -606,6 +834,7 @@ export class ScreenliteAdapter implements CMSAdapter, PairableCMSAdapter {
 
     private emitTemplateUpdate(playlists: Playlist[]): void {
         const signature = JSON.stringify(playlists)
+
         if (signature === this.lastTemplateSignature) {
             return
         }
@@ -648,6 +877,7 @@ export class ScreenliteAdapter implements CMSAdapter, PairableCMSAdapter {
 
     private handleUnauthorized(): void {
         this.stopLoops()
+        this.disconnectWebSocket()
         this.clearStoredLink()
         this.updateStatus('unauthorized')
     }
@@ -656,6 +886,8 @@ export class ScreenliteAdapter implements CMSAdapter, PairableCMSAdapter {
         this.token = null
         this.linkedDevice = null
         this.lastTemplateSignature = null
+        this.latestTemplateByScreenId.clear()
+        this.latestScheduleByScreenId.clear()
         localStorage.removeItem(TOKEN_STORAGE_KEY)
         localStorage.removeItem(LINKED_DEVICE_STORAGE_KEY)
         localStorage.removeItem(DEVICE_METADATA_STORAGE_KEY)
@@ -664,10 +896,12 @@ export class ScreenliteAdapter implements CMSAdapter, PairableCMSAdapter {
     private readLinkedDevice(): LinkedDeviceInfo | null {
         try {
             const raw = localStorage.getItem(LINKED_DEVICE_STORAGE_KEY)
+
             if (!raw) {
                 return null
             }
             const parsed = JSON.parse(raw) as LinkedDeviceInfo
+
             return {
                 deviceId: parsed.deviceId ?? null,
                 screenId: parsed.screenId ?? null,
@@ -681,6 +915,7 @@ export class ScreenliteAdapter implements CMSAdapter, PairableCMSAdapter {
     private normalizeBaseUrl(url: string): string {
         const input = url?.trim() || window.location.origin
         const parsed = new URL(input, window.location.origin)
+
         return parsed.origin + parsed.pathname.replace(/\/$/, '')
     }
 
@@ -692,6 +927,7 @@ export class ScreenliteAdapter implements CMSAdapter, PairableCMSAdapter {
         const parts = [telemetry.hostname, telemetry.macAddress, telemetry.platform]
             .map(value => String(value || '').trim())
             .filter(Boolean)
+
         return parts.join('-') || `browser-${Date.now()}`
     }
 

@@ -1,4 +1,5 @@
 import type { MediaItem } from '../types'
+import { runtimeClock } from '../services/runtimeClock'
 
 const ENABLE_PLAYBACK_TRACKER = import.meta.env.VITE_ENABLE_PLAYBACK_TRACKER === 'true'
 
@@ -14,6 +15,9 @@ export class MediaItemRenderer {
     private hasReportedError = false
     private capTimeoutId: ReturnType<typeof setTimeout> | null = null
     private onMediaError: MediaErrorHandler
+    private dynamicTextUnsubscribe: (() => void) | null = null
+    private tickerAnimation: Animation | null = null
+    private lastTextPayload = ''
 
     constructor(item: MediaItem, onMediaError?: MediaErrorHandler) {
         this.hidden = item.hidden
@@ -23,6 +27,7 @@ export class MediaItemRenderer {
 
         if (item.type === 'image') {
             const img = document.createElement('img')
+
             img.onerror = () => {
                 this.reportError('image failed to load')
             }
@@ -30,6 +35,7 @@ export class MediaItemRenderer {
             this.el = img
         } else if (item.type === 'video') {
             const video = document.createElement('video')
+
             video.loop = false
             video.muted = true
             video.playsInline = true
@@ -37,6 +43,7 @@ export class MediaItemRenderer {
                 this.reportError('video playback error')
             }
             const source = document.createElement('source')
+
             source.src = item.src
             source.type = 'video/mp4'
             source.onerror = () => {
@@ -46,6 +53,7 @@ export class MediaItemRenderer {
             this.el = video
         } else {
             const textBox = document.createElement('div')
+
             this.applyTextPayload(textBox, item.src)
             this.el = textBox
         }
@@ -64,10 +72,15 @@ export class MediaItemRenderer {
 
     update(item: MediaItem): void {
         const prevHidden = this.hidden
+
         this.hidden = item.hidden
         this.itemDurationMs = Math.max(0, item.duration)
 
-        if (item.type === 'text' && this.el instanceof HTMLDivElement) {
+        if (
+            item.type === 'text' &&
+            this.el instanceof HTMLDivElement &&
+            (item.src !== this.lastTextPayload || (item.hidden !== prevHidden && !item.hidden))
+        ) {
             this.applyTextPayload(this.el, item.src)
         }
 
@@ -75,6 +88,7 @@ export class MediaItemRenderer {
 
         if (item.type === 'video') {
             const video = this.el as HTMLVideoElement
+
             if (item.hidden && !prevHidden) {
                 this.clearCapTimer()
                 video.pause()
@@ -124,6 +138,9 @@ export class MediaItemRenderer {
     }
 
     private applyTextPayload(el: HTMLDivElement, src: string): void {
+        this.cleanupDynamicText()
+        this.lastTextPayload = src
+
         type TextPayload = {
             text?: string
             style?: Record<string, unknown>
@@ -133,6 +150,7 @@ export class MediaItemRenderer {
 
         try {
             const parsed = JSON.parse(src) as TextPayload
+
             if (parsed && typeof parsed === 'object') {
                 payload = parsed
             }
@@ -141,7 +159,9 @@ export class MediaItemRenderer {
         }
 
         const style = payload.style ?? {}
-        el.textContent = String(payload.text ?? '')
+        const rawText = String(payload.text ?? '')
+        const widgetKind = String(style.widgetKind ?? '').toLowerCase()
+
         el.style.display = 'flex'
         el.style.alignItems = 'center'
         el.style.justifyContent = 'center'
@@ -156,6 +176,200 @@ export class MediaItemRenderer {
         if (typeof style.background === 'string') {
             el.style.background = style.background
         }
+
+        if (widgetKind === 'ticker') {
+            this.applyTickerWidget(el, rawText, style)
+            return
+        }
+
+        if (widgetKind === 'clock' || widgetKind === 'date') {
+            this.applyDynamicDateTimeWidget(el, widgetKind, style)
+            return
+        }
+
+        el.textContent = rawText
+    }
+
+    private applyTickerWidget(el: HTMLDivElement, text: string, style: Record<string, unknown>): void {
+        const speed = this.readTickerSpeed(style)
+        const gapPx = this.readTickerGap(style)
+        const durationSeconds = this.resolveTickerDurationSeconds(speed)
+
+        const viewport = document.createElement('div')
+        const track = document.createElement('div')
+        const itemA = document.createElement('span')
+        const itemB = document.createElement('span')
+        const itemC = document.createElement('span')
+
+        itemA.textContent = text
+        itemB.textContent = text
+        itemC.textContent = text
+        Object.assign(itemA.style, {
+            display: 'inline-block',
+            whiteSpace: 'nowrap',
+            flexShrink: '0',
+        })
+        Object.assign(itemB.style, {
+            display: 'inline-block',
+            whiteSpace: 'nowrap',
+            flexShrink: '0',
+        })
+        Object.assign(itemC.style, {
+            display: 'inline-block',
+            whiteSpace: 'nowrap',
+            flexShrink: '0',
+        })
+
+        Object.assign(track.style, {
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: `${gapPx}px`,
+            paddingLeft: '100%',
+            willChange: 'transform',
+            whiteSpace: 'nowrap',
+        })
+        track.appendChild(itemA)
+        track.appendChild(itemB)
+        track.appendChild(itemC)
+
+        Object.assign(viewport.style, {
+            width: '100%',
+            height: '100%',
+            overflow: 'hidden',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'flex-start',
+        })
+        viewport.appendChild(track)
+
+        el.textContent = ''
+        el.style.display = 'flex'
+        el.style.alignItems = 'center'
+        el.style.justifyContent = 'flex-start'
+        el.style.overflow = 'hidden'
+        el.style.whiteSpace = 'nowrap'
+        el.style.padding = '8px 0'
+        el.style.position = 'relative'
+        el.appendChild(viewport)
+
+        this.tickerAnimation = track.animate(
+            [
+                { transform: 'translateX(0px)' },
+                { transform: 'translateX(-66.666%)' },
+            ],
+            {
+                duration: durationSeconds * 1000,
+                iterations: Number.POSITIVE_INFINITY,
+                easing: 'linear',
+            },
+        )
+    }
+
+    private applyDynamicDateTimeWidget(
+        el: HTMLDivElement,
+        widgetKind: 'clock' | 'date',
+        style: Record<string, unknown>,
+    ): void {
+        const locale = typeof style.locale === 'string' ? style.locale : undefined
+        const format = typeof style.format === 'string' ? style.format : undefined
+        const explicitTimeZone = typeof style.timeZone === 'string' ? style.timeZone : undefined
+        const timeZone = explicitTimeZone || runtimeClock.getServerTimeZone() || undefined
+
+        const render = () => {
+            const now = runtimeClock.getNow()
+
+            el.textContent =
+                widgetKind === 'clock'
+                    ? this.formatClock(now, locale, format, timeZone)
+                    : this.formatDate(now, locale, format, timeZone)
+        }
+
+        this.dynamicTextUnsubscribe = runtimeClock.subscribe(render)
+        render()
+    }
+
+    private formatClock(date: Date, locale?: string, format?: string, timeZone?: string): string {
+        if (format === '24h') {
+            return new Intl.DateTimeFormat(locale, {
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit',
+                hour12: false,
+                timeZone,
+            }).format(date)
+        }
+
+        return new Intl.DateTimeFormat(locale, {
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit',
+            hour12: true,
+            timeZone,
+        }).format(date)
+    }
+
+    private formatDate(date: Date, locale?: string, format?: string, timeZone?: string): string {
+        if (format === 'short') {
+            return new Intl.DateTimeFormat(locale, {
+                year: 'numeric',
+                month: '2-digit',
+                day: '2-digit',
+                timeZone,
+            }).format(date)
+        }
+
+        return new Intl.DateTimeFormat(locale, {
+            weekday: 'long',
+            year: 'numeric',
+            month: 'long',
+            day: 'numeric',
+            timeZone,
+        }).format(date)
+    }
+
+    private readTickerSpeed(style: Record<string, unknown>): number {
+        const raw = style.tickerSpeed ?? style.ticker_speed ?? style.speed ?? style.marqueeSpeed
+
+        if (typeof raw === 'number' && Number.isFinite(raw)) {
+            return Math.max(10, Math.min(200, raw))
+        }
+        if (typeof raw === 'string' && raw.trim().length > 0) {
+            const parsed = Number(raw)
+
+            if (Number.isFinite(parsed)) {
+                return Math.max(10, Math.min(200, parsed))
+            }
+        }
+
+        return 70
+    }
+
+    private resolveTickerDurationSeconds(speed: number): number {
+        return Math.max(6, 240 / Math.max(10, Math.min(200, speed)))
+    }
+
+    private readTickerGap(style: Record<string, unknown>): number {
+        const raw = style.tickerGap ?? style.ticker_gap ?? style.gap
+
+        if (typeof raw === 'number' && Number.isFinite(raw)) {
+            return Math.max(8, raw)
+        }
+        if (typeof raw === 'string' && raw.trim().length > 0) {
+            const parsed = Number(raw)
+
+            if (Number.isFinite(parsed)) {
+                return Math.max(8, parsed)
+            }
+        }
+
+        return 48
+    }
+
+    private cleanupDynamicText(): void {
+        this.tickerAnimation?.cancel()
+        this.tickerAnimation = null
+        this.dynamicTextUnsubscribe?.()
+        this.dynamicTextUnsubscribe = null
     }
 
     private applyState(item: MediaItem): void {
@@ -189,6 +403,7 @@ export class MediaItemRenderer {
 
     unmount(): void {
         this.clearCapTimer()
+        this.cleanupDynamicText()
         this.el.remove()
     }
 }

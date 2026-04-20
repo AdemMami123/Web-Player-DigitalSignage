@@ -111,6 +111,37 @@ export type PlayerScheduleResponse = {
     }
 }
 
+export type PlayerContentSyncPayload = {
+    screenId?: string
+    template?: PlayerTemplateDto | null
+    schedule?: PlayerScheduleResponse | PlayerPlaylistDto[] | null
+    reason?: string
+    recommendedClockTickMs?: number
+    serverEpochMs?: number
+    serverTimeZone?: string
+}
+
+export type PlayerScreenStatusPayload = {
+    screenId?: string
+    status?: string
+    heartbeatAt?: string
+    recommendedClockTickMs?: number
+    serverEpochMs?: number
+    serverTimeZone?: string
+}
+
+export type PlayerWsUpdateEvent = {
+    type?: string
+    reason?: string
+    payload?: PlayerContentSyncPayload | PlayerScreenStatusPayload | null
+    screenId?: string
+    template?: PlayerTemplateDto | null
+    schedule?: PlayerScheduleResponse | PlayerPlaylistDto[] | null
+    recommendedClockTickMs?: number
+    serverEpochMs?: number
+    serverTimeZone?: string
+}
+
 export type ScreenliteApiResult<T> = {
     ok: boolean
     unauthorized: boolean

@@ -13,8 +13,11 @@
     "test:e2e:runtime:gate": "npm run test:e2e:runtime && npm run test:e2e:runtime"
   },
   "dependencies": {
+    "@stomp/stompjs": "^7.3.0",
     "@tailwindcss/vite": "^4.1.6",
+    "@types/sockjs-client": "^1.5.4",
     "lodash": "^4.17.21",
+    "sockjs-client": "^1.6.1",
     "tailwindcss": "^4.1.6"
   },
   "devDependencies": {

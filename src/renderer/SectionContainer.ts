@@ -8,7 +8,7 @@ export class SectionContainer {
     private renderers = new Map<string, MediaItemRenderer>()
     private mediaItems: MediaItem[] = []
     private totalDuration = 0
-    private lastItemIds = ''
+    private lastItemsSignature = ''
     private failedItemIds = new Set<string>()
 
     constructor() {
@@ -28,9 +28,11 @@ export class SectionContainer {
 
         const sequenceState = calculateMediaSequenceState(this.mediaItems, elapsedSinceStart, this.totalDuration)
         const timelineItems = updateMediaItemsState(this.mediaItems, sequenceState)
+
         this.mediaItems = this.applyFailureAwareState(timelineItems, sequenceState.currentIndex)
 
         const activeIds = new Set<string>()
+
         for (const item of this.mediaItems) {
             activeIds.add(item.id)
 
@@ -48,6 +50,7 @@ export class SectionContainer {
                 const renderer = new MediaItemRenderer(item, (itemId, error) => {
                     this.handleMediaFailure(itemId, error)
                 })
+
                 renderer.mount(this.el)
                 this.renderers.set(item.id, renderer)
             }
@@ -62,9 +65,12 @@ export class SectionContainer {
     }
 
     private syncItems(section: Section): void {
-        const newIds = section.items.map(i => i.id).join(',')
-        if (newIds === this.lastItemIds) return
-        this.lastItemIds = newIds
+        const nextSignature = section.items
+            .map(item => `${item.id}|${item.content_type}|${item.content_path}|${item.duration}`)
+            .join('||')
+
+        if (nextSignature === this.lastItemsSignature) return
+        this.lastItemsSignature = nextSignature
         this.failedItemIds.clear()
 
         let items: MediaItem[] = section.items.map(item => ({
@@ -95,6 +101,7 @@ export class SectionContainer {
         }
 
         const failedIndexes = new Set<number>()
+
         for (let i = 0; i < items.length; i++) {
             if (this.failedItemIds.has(items[i].id)) {
                 failedIndexes.add(i)
@@ -106,6 +113,7 @@ export class SectionContainer {
         }
 
         const currentPlayable = this.findNextPlayableIndex(items, currentIndex, failedIndexes)
+
         if (currentPlayable === null) {
             return items.map(item => ({
                 ...item,
@@ -133,8 +141,10 @@ export class SectionContainer {
         }
 
         const normalizedStart = ((startIndex % items.length) + items.length) % items.length
+
         for (let offset = 0; offset < items.length; offset++) {
             const idx = (normalizedStart + offset) % items.length
+
             if (!failedIndexes.has(idx)) {
                 return idx
             }
