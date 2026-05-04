@@ -58,13 +58,15 @@ export class MediaItemRenderer {
             this.el = textBox
         }
 
+        // Use objectFit from item or default to 'cover'
+        const objectFit = item.objectFit ?? 'cover'
         Object.assign(this.el.style, {
             position: 'absolute',
             top: '0',
             left: '0',
             width: '100%',
             height: '100%',
-            objectFit: 'cover',
+            objectFit: objectFit,
         })
 
         this.applyState(item)

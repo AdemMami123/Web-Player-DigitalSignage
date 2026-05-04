@@ -56,6 +56,9 @@ export class ScreenliteAdapter implements CMSAdapter, PairableCMSAdapter {
     private stompClient: Client | null = null
     private latestTemplateByScreenId = new Map<string, PlayerTemplateDto>()
     private latestScheduleByScreenId = new Map<string, PlayerScheduleResponse | PlayerPlaylistDto[]>()
+    private latestCompiledPlaylistByScreenId = new Map<string, unknown>()
+    private compiledPlaylistTimers = new Map<string, number>()
+    private latestTemplatesListByScreenId = new Map<string, PlayerTemplateDto[]>()
     private lifecycleId = 0
     private resumeListenerAttached = false
     private readonly onVisibilityChange = () => {
@@ -333,6 +336,35 @@ export class ScreenliteAdapter implements CMSAdapter, PairableCMSAdapter {
         return null
     }
 
+    private async fetchCompiledPlaylistOnce(): Promise<unknown | null> {
+        if (!this.connected) {
+            return null
+        }
+
+        if (!this.token) {
+            this.updateStatus('waiting_for_pairing')
+            return null
+        }
+
+        const deviceId = this.linkedDevice?.deviceId
+        const screenId = this.getLinkedScreenId()
+
+        const response = await this.apiClient.getCompiledPlaylist(this.token, deviceId ?? undefined, screenId ?? undefined)
+
+        if (response.unauthorized) {
+            console.warn('ScreenliteAdapter: Compiled playlist request unauthorized, clearing device token')
+            this.handleUnauthorized()
+            return null
+        }
+
+        if (response.ok && response.data) {
+            return response.data
+        }
+
+        console.warn('ScreenliteAdapter: Compiled playlist fetch failed', response.error)
+        return null
+    }
+
     private async fetchTemplatesOnce(): Promise<PlayerTemplateDto[] | null> {
         if (!this.connected) {
             return null
@@ -596,7 +628,11 @@ export class ScreenliteAdapter implements CMSAdapter, PairableCMSAdapter {
         this.bootstrapInFlight = true
 
         try {
-            const [templates, schedule] = await Promise.all([this.fetchTemplatesOnce(), this.fetchScheduleOnce()])
+            const [templates, schedule, compiled] = await Promise.all([
+                this.fetchTemplatesOnce(),
+                this.fetchScheduleOnce(),
+                this.fetchCompiledPlaylistOnce(),
+            ])
 
             if (!this.connected || !this.token) {
                 return false
@@ -611,10 +647,20 @@ export class ScreenliteAdapter implements CMSAdapter, PairableCMSAdapter {
                 if (template) {
                     this.latestTemplateByScreenId.set(screenKey, template)
                 }
+
+                this.latestTemplatesListByScreenId.set(screenKey, templates)
             }
 
             if (schedule) {
                 this.latestScheduleByScreenId.set(screenKey, schedule)
+            }
+
+            if (compiled) {
+                this.latestCompiledPlaylistByScreenId.set(screenKey, compiled)
+                this.ensureCompiledPlaylistTimer(screenKey)
+            } else {
+                this.latestCompiledPlaylistByScreenId.delete(screenKey)
+                this.clearCompiledPlaylistTimer(screenKey)
             }
 
             const template = this.latestTemplateByScreenId.get(screenKey) ?? null
@@ -637,6 +683,20 @@ export class ScreenliteAdapter implements CMSAdapter, PairableCMSAdapter {
             return
         }
 
+        const screenKey = this.screenMapKey(screenId)
+
+        const compiled = this.latestCompiledPlaylistByScreenId.get(screenKey) ?? null
+
+        if (compiled) {
+            const compiledPlaylist = compiled as any
+            const built = this.buildPlaylistForCurrentCompiledItem(screenKey, compiledPlaylist)
+
+            if (built && built.length > 0) {
+                this.emitTemplateUpdate(built)
+                return
+            }
+        }
+
         const schedulePlaylists = schedule ? this.extractPlaylists(schedule) : null
 
         if (schedulePlaylists && schedulePlaylists.length > 0) {
@@ -650,6 +710,86 @@ export class ScreenliteAdapter implements CMSAdapter, PairableCMSAdapter {
         }
 
         this.emitTemplateUpdate([this.buildPlaceholderPlaylist()])
+    }
+
+    private buildPlaylistForCurrentCompiledItem(screenKey: string, compiled: any): Playlist[] | null {
+        try {
+            const items = Array.isArray(compiled.items) ? compiled.items : compiled.data?.items ?? null
+
+            if (!items || items.length === 0) return null
+
+            const durations = items.map((it: any) => Math.max(0, Number(it.duration ?? 10)))
+            const total = durations.reduce((s: number, d: number) => s + d, 0)
+
+            if (total <= 0) return null
+
+            const compiledAtMs = compiled.compiledAt ? Date.parse(String(compiled.compiledAt)) : 0
+            const nowMs = runtimeClock.getNow().getTime()
+            const elapsedSec = ((nowMs - (compiledAtMs || 0)) / 1000) % total
+            const normalizedElapsed = elapsedSec < 0 ? elapsedSec + total : elapsedSec
+
+            let accum = 0
+            let idx = 0
+            for (let i = 0; i < durations.length; i++) {
+                accum += durations[i]
+                if (normalizedElapsed < accum) {
+                    idx = i
+                    break
+                }
+            }
+
+            const item = items[idx]
+            const templateId = String(item.templateId ?? item.template_id ?? '')
+
+            const templates = this.latestTemplatesListByScreenId.get(screenKey) ?? []
+            let tpl = templates.find(t => String(t.templateId ?? '') === templateId) ?? null
+
+            if (!tpl) {
+                tpl = this.latestTemplateByScreenId.get(screenKey) ?? null
+            }
+
+            if (!tpl) return null
+
+            const playlists = this.normalizeTemplatePlaylists([tpl])
+
+            if (!playlists || playlists.length === 0) return null
+
+            // Override durations on the produced playlist to match compiled item duration
+            const duration = Math.max(0, Number(item.duration ?? 10))
+            for (const pl of playlists) {
+                for (const section of pl.sections ?? []) {
+                    for (const it of section.items ?? []) {
+                        it.duration = duration
+                    }
+                }
+            }
+
+            return playlists
+        } catch (err) {
+            console.warn('ScreenliteAdapter: Failed to build playlist from compiled data', err)
+            return null
+        }
+    }
+
+    private ensureCompiledPlaylistTimer(screenKey: string): void {
+        if (this.compiledPlaylistTimers.has(screenKey)) return
+
+        const id = window.setInterval(() => {
+            const template = this.latestTemplateByScreenId.get(screenKey) ?? null
+            const schedule = this.latestScheduleByScreenId.get(screenKey) ?? null
+            const screenId = this.getLinkedScreenId()
+            this.emitResolvedContent(screenId, template, schedule)
+        }, 1000)
+
+        this.compiledPlaylistTimers.set(screenKey, id)
+    }
+
+    private clearCompiledPlaylistTimer(screenKey: string): void {
+        const id = this.compiledPlaylistTimers.get(screenKey)
+        if (id !== undefined) {
+            clearInterval(id)
+            this.compiledPlaylistTimers.delete(screenKey)
+        }
     }
 
     private pickTemplateForScreen(templates: PlayerTemplateDto[], screenId: string | null): PlayerTemplateDto | null {
@@ -743,6 +883,10 @@ export class ScreenliteAdapter implements CMSAdapter, PairableCMSAdapter {
                         width: normalized.width,
                         height: normalized.height,
                         z_index: elementIndex,
+                        xPct: normalized.xPct,
+                        yPct: normalized.yPct,
+                        widthPct: normalized.widthPct,
+                        heightPct: normalized.heightPct,
                     },
                     items: [
                         {
@@ -750,6 +894,7 @@ export class ScreenliteAdapter implements CMSAdapter, PairableCMSAdapter {
                             content_type: normalized.contentType,
                             content_path: normalized.contentPath,
                             duration: 3600,
+                            objectFit: normalized.objectFit,
                         },
                     ],
                 }
@@ -764,6 +909,9 @@ export class ScreenliteAdapter implements CMSAdapter, PairableCMSAdapter {
                 width: layout.width,
                 height: layout.height,
                 background: layout.background,
+                backgroundColor: layout.backgroundColor,
+                backgroundImageUrl: layout.backgroundImageUrl,
+                backgroundImageFit: layout.backgroundImageFit,
                 sections,
             }
         })
@@ -774,6 +922,9 @@ export class ScreenliteAdapter implements CMSAdapter, PairableCMSAdapter {
             width: Number(layout?.width ?? 1920),
             height: Number(layout?.height ?? 1080),
             background: String(layout?.background ?? '#000000'),
+            backgroundColor: layout?.backgroundColor,
+            backgroundImageUrl: layout?.backgroundImageUrl,
+            backgroundImageFit: layout?.backgroundImageFit,
             elements: Array.isArray(layout?.elements) ? layout.elements : [],
         }
     }
@@ -783,14 +934,24 @@ export class ScreenliteAdapter implements CMSAdapter, PairableCMSAdapter {
         y: number
         width: number
         height: number
+        xPct?: number
+        yPct?: number
+        widthPct?: number
+        heightPct?: number
         contentType: string
         contentPath: string
+        objectFit?: 'cover' | 'contain' | 'fill'
     } {
         const x = Number(element.x ?? 0)
         const y = Number(element.y ?? 0)
         const width = Number(element.width ?? 200)
         const height = Number(element.height ?? 100)
+        const xPct = element.xPct
+        const yPct = element.yPct
+        const widthPct = element.widthPct
+        const heightPct = element.heightPct
         const type = String(element.type ?? '').toLowerCase()
+        const objectFit = element.objectFit
 
         if (type === 'image' && element.imageUrl) {
             return {
@@ -798,8 +959,13 @@ export class ScreenliteAdapter implements CMSAdapter, PairableCMSAdapter {
                 y,
                 width,
                 height,
+                xPct,
+                yPct,
+                widthPct,
+                heightPct,
                 contentType: 'image',
                 contentPath: String(element.imageUrl),
+                objectFit,
             }
         }
 
@@ -813,8 +979,13 @@ export class ScreenliteAdapter implements CMSAdapter, PairableCMSAdapter {
             y,
             width,
             height,
+            xPct,
+            yPct,
+            widthPct,
+            heightPct,
             contentType: 'text',
             contentPath: JSON.stringify(textPayload),
+            objectFit,
         }
     }
 
@@ -855,6 +1026,10 @@ export class ScreenliteAdapter implements CMSAdapter, PairableCMSAdapter {
                 end_time: String(value.end_time ?? '23:59:59'),
                 width: Number(value.width ?? 1920),
                 height: Number(value.height ?? 1080),
+                background: (value as any)?.background,
+                backgroundColor: (value as any)?.backgroundColor,
+                backgroundImageUrl: (value as any)?.backgroundImageUrl,
+                backgroundImageFit: (value as any)?.backgroundImageFit,
                 sections: Array.isArray(value.sections) ? (value.sections as Playlist['sections']) : [],
             }
         })
@@ -888,6 +1063,11 @@ export class ScreenliteAdapter implements CMSAdapter, PairableCMSAdapter {
         this.lastTemplateSignature = null
         this.latestTemplateByScreenId.clear()
         this.latestScheduleByScreenId.clear()
+        this.latestCompiledPlaylistByScreenId.clear()
+        this.latestTemplatesListByScreenId.clear()
+        for (const key of this.compiledPlaylistTimers.keys()) {
+            this.clearCompiledPlaylistTimer(key)
+        }
         localStorage.removeItem(TOKEN_STORAGE_KEY)
         localStorage.removeItem(LINKED_DEVICE_STORAGE_KEY)
         localStorage.removeItem(DEVICE_METADATA_STORAGE_KEY)

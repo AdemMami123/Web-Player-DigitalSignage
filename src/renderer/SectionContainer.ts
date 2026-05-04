@@ -2,6 +2,7 @@ import type { Section, MediaItem } from '../types'
 import { calculateMediaSequenceState } from '../utils/calculateCurrentMediaState'
 import { updateMediaItemsState } from '../utils/updateMediaItemsState'
 import { MediaItemRenderer } from './MediaItemRenderer'
+import { resolveRect } from '../utils/resolveRect'
 
 export class SectionContainer {
     el: HTMLDivElement
@@ -17,11 +18,29 @@ export class SectionContainer {
         this.el.style.overflow = 'hidden'
     }
 
-    update(section: Section, scale: number, elapsedSinceStart: number): void {
-        this.el.style.left = `${Math.floor(section.position.x * scale)}px`
-        this.el.style.top = `${Math.floor(section.position.y * scale)}px`
-        this.el.style.width = `${Math.floor(section.position.width * scale)}px`
-        this.el.style.height = `${Math.floor(section.position.height * scale)}px`
+    update(section: Section, layoutWidth: number, layoutHeight: number, viewportWidth: number, viewportHeight: number, elapsedSinceStart: number): void {
+        // Use resolveRect to compute pixel coordinates from percentage or absolute values
+        const rect = resolveRect(
+            {
+                x: section.position.x,
+                y: section.position.y,
+                width: section.position.width,
+                height: section.position.height,
+                xPct: section.position.xPct,
+                yPct: section.position.yPct,
+                widthPct: section.position.widthPct,
+                heightPct: section.position.heightPct,
+            },
+            layoutWidth,
+            layoutHeight,
+            viewportWidth,
+            viewportHeight,
+        )
+
+        this.el.style.left = `${rect.x}px`
+        this.el.style.top = `${rect.y}px`
+        this.el.style.width = `${rect.width}px`
+        this.el.style.height = `${rect.height}px`
         this.el.style.zIndex = String(section.position.z_index)
 
         this.syncItems(section)
@@ -80,6 +99,7 @@ export class SectionContainer {
             duration: item.duration * 1000,
             hidden: true,
             preload: false,
+            objectFit: item.objectFit,
         }))
 
         if (items.length === 1) {

@@ -26,15 +26,23 @@ export type PlayerTemplateElementDto = {
     y?: number
     width?: number
     height?: number
+    xPct?: number
+    yPct?: number
+    widthPct?: number
+    heightPct?: number
     text?: string
     imageUrl?: string
     style?: Record<string, unknown>
+    objectFit?: 'cover' | 'contain' | 'fill'
 }
 
 export type PlayerTemplateLayoutDto = {
     width?: number
     height?: number
     background?: string
+    backgroundColor?: string
+    backgroundImageUrl?: string
+    backgroundImageFit?: 'cover' | 'contain' | 'fill'
     elements?: PlayerTemplateElementDto[]
 }
 

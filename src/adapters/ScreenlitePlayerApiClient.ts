@@ -65,6 +65,25 @@ export class ScreenlitePlayerApiClient {
         })
     }
 
+    getCompiledPlaylist(
+        deviceToken: string,
+        deviceId: string | undefined,
+        screenId: string | undefined,
+    ): Promise<ScreenliteApiResult<unknown>> {
+        if (!deviceId || !screenId) {
+            return Promise.resolve({ ok: false, unauthorized: false, data: null, error: 'Missing deviceId or screenId' })
+        }
+
+        const endpoint = `/api/device/${encodeURIComponent(deviceId)}/screen/${encodeURIComponent(screenId)}/playlist`
+
+        return this.fetchJson(endpoint, {
+            method: 'GET',
+            headers: {
+                'X-Device-Token': deviceToken,
+            },
+        })
+    }
+
     private buildScheduleEndpoint(screenId?: string): string {
         if (!screenId) {
             return '/api/player/schedule'

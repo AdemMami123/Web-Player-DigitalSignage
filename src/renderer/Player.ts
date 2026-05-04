@@ -2,12 +2,6 @@ import type { Playlist } from '../types'
 import { getActivePlaylist } from '../utils/getActivePlaylist'
 import { PlaylistRenderer } from './PlaylistRenderer'
 
-function calcScale(playlist: Playlist): number {
-    const scaleX = window.innerWidth / playlist.width
-    const scaleY = window.innerHeight / playlist.height
-    return Math.min(scaleX, scaleY)
-}
-
 export class Player {
     el: HTMLDivElement
     private playlistRenderer: PlaylistRenderer | null = null
@@ -49,8 +43,10 @@ export class Player {
         }
 
         if (this.playlistRenderer) {
-            const scale = calcScale(activePlaylist)
-            this.playlistRenderer.update(activePlaylist, elapsedSinceStart, scale)
+            // Use actual viewport dimensions instead of calculating scale
+            const viewportWidth = window.innerWidth
+            const viewportHeight = window.innerHeight
+            this.playlistRenderer.update(activePlaylist, elapsedSinceStart, viewportWidth, viewportHeight)
         }
     }
 

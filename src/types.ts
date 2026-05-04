@@ -7,6 +7,9 @@ export type Playlist = {
 	width: number
 	height: number
 	background?: string
+	backgroundColor?: string
+	backgroundImageUrl?: string
+	backgroundImageFit?: 'cover' | 'contain' | 'fill'
 	sections: Section[]
 }
 
@@ -26,6 +29,10 @@ type Position = {
 	width: number
 	height: number
 	z_index: number
+	xPct?: number
+	yPct?: number
+	widthPct?: number
+	heightPct?: number
 }
 
 export type Item = {
@@ -33,6 +40,7 @@ export type Item = {
 	content_type: 'image' | 'video' | string
 	content_path: string
 	duration: number
+	objectFit?: 'cover' | 'contain' | 'fill'
 }
 
 export type MediaItem = {
