@@ -50,6 +50,7 @@ export type MediaItem = {
 	duration: number,
 	hidden: boolean,
 	preload: boolean,
+	objectFit?: 'cover' | 'contain' | 'fill',
 }
 
 export type MediaSequenceState = {

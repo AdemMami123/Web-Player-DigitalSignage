@@ -39,6 +39,10 @@ export type PlayerTemplateElementDto = {
 export type PlayerTemplateLayoutDto = {
     width?: number
     height?: number
+    baseResolution?: {
+        width?: number
+        height?: number
+    }
     background?: string
     backgroundColor?: string
     backgroundImageUrl?: string

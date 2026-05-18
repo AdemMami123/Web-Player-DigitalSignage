@@ -35,7 +35,7 @@ function transformPlaylist(playlist: PlaygroundPlaylist, baseUrl: string): Playl
             id: item.id,
             content_type: item.file.type,
             content_path: `${baseUrl}/uploads/${item.file.filename}`,
-            duration: item.duration,
+            duration: item.duration * 60,
         }))
 
     const section: Section = {

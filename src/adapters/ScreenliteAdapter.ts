@@ -7,6 +7,7 @@ import type {
     PlayerPairConsumeResponse,
     PlayerPlaylistDto,
     PlayerScheduleResponse,
+    PlayerScheduleSectionDto,
     PlayerScreenStatusPayload,
     PlayerTemplateDto,
     PlayerTemplateElementDto,
@@ -507,7 +508,7 @@ export class ScreenliteAdapter implements CMSAdapter, PairableCMSAdapter {
             const type = String(event.type ?? '').toUpperCase()
 
             if (type === 'CONTENT_SYNC') {
-                this.handleContentSyncEvent(event)
+                void this.handleContentSyncEvent(event)
                 return
             }
 
@@ -558,7 +559,7 @@ export class ScreenliteAdapter implements CMSAdapter, PairableCMSAdapter {
         return trimmed.length > 0 ? trimmed : null
     }
 
-    private handleContentSyncEvent(event: PlayerWsUpdateEvent): void {
+    private async handleContentSyncEvent(event: PlayerWsUpdateEvent): Promise<void> {
         const payload =
             event.payload && typeof event.payload === 'object' ? (event.payload as PlayerContentSyncPayload) : null
         const incomingTemplate = payload?.template ?? event.template ?? null
@@ -588,7 +589,7 @@ export class ScreenliteAdapter implements CMSAdapter, PairableCMSAdapter {
         const resolvedTemplate = this.latestTemplateByScreenId.get(screenKey) ?? null
         const resolvedSchedule = this.latestScheduleByScreenId.get(screenKey) ?? null
 
-        this.emitResolvedContent(screenId, resolvedTemplate, resolvedSchedule)
+        await this.emitResolvedContent(screenId, resolvedTemplate, resolvedSchedule)
     }
 
     private handleScreenStatusEvent(event: PlayerWsUpdateEvent): void {
@@ -666,7 +667,7 @@ export class ScreenliteAdapter implements CMSAdapter, PairableCMSAdapter {
             const template = this.latestTemplateByScreenId.get(screenKey) ?? null
             const normalizedSchedule = this.latestScheduleByScreenId.get(screenKey) ?? null
 
-            this.emitResolvedContent(activeScreenId, template, normalizedSchedule)
+            await this.emitResolvedContent(activeScreenId, template, normalizedSchedule)
 
             return Boolean(template || normalizedSchedule)
         } finally {
@@ -674,11 +675,11 @@ export class ScreenliteAdapter implements CMSAdapter, PairableCMSAdapter {
         }
     }
 
-    private emitResolvedContent(
+    private async emitResolvedContent(
         screenId: string | null,
         template: PlayerTemplateDto | null,
         schedule: PlayerScheduleResponse | PlayerPlaylistDto[] | null,
-    ): void {
+    ): Promise<void> {
         if (!this.shouldProcessScreen(screenId)) {
             return
         }
@@ -697,7 +698,9 @@ export class ScreenliteAdapter implements CMSAdapter, PairableCMSAdapter {
             }
         }
 
-        const schedulePlaylists = schedule ? this.extractPlaylists(schedule) : null
+        // Resolve schedule/templates asynchronously because template layout resolution
+        // may require fetching a template by id from the backend.
+        const schedulePlaylists = schedule ? await this.extractPlaylists(schedule) : null
 
         if (schedulePlaylists && schedulePlaylists.length > 0) {
             this.emitTemplateUpdate(schedulePlaylists)
@@ -718,7 +721,8 @@ export class ScreenliteAdapter implements CMSAdapter, PairableCMSAdapter {
 
             if (!items || items.length === 0) return null
 
-            const durations = items.map((it: any) => Math.max(0, Number(it.duration ?? 10)))
+            // Backend returns duration in minutes, convert to seconds
+            const durations = items.map((it: any) => Math.max(0, Number(it.duration ?? 10) * 60))
             const total = durations.reduce((s: number, d: number) => s + d, 0)
 
             if (total <= 0) return null
@@ -775,10 +779,12 @@ export class ScreenliteAdapter implements CMSAdapter, PairableCMSAdapter {
         if (this.compiledPlaylistTimers.has(screenKey)) return
 
         const id = window.setInterval(() => {
-            const template = this.latestTemplateByScreenId.get(screenKey) ?? null
-            const schedule = this.latestScheduleByScreenId.get(screenKey) ?? null
-            const screenId = this.getLinkedScreenId()
-            this.emitResolvedContent(screenId, template, schedule)
+            void (async () => {
+                const template = this.latestTemplateByScreenId.get(screenKey) ?? null
+                const schedule = this.latestScheduleByScreenId.get(screenKey) ?? null
+                const screenId = this.getLinkedScreenId()
+                await this.emitResolvedContent(screenId, template, schedule)
+            })()
         }, 1000)
 
         this.compiledPlaylistTimers.set(screenKey, id)
@@ -826,9 +832,9 @@ export class ScreenliteAdapter implements CMSAdapter, PairableCMSAdapter {
         return mountedScreenId === screenId
     }
 
-    private extractPlaylists(payload: PlayerScheduleResponse | PlayerPlaylistDto[]): Playlist[] | null {
+    private async extractPlaylists(payload: PlayerScheduleResponse | PlayerPlaylistDto[]): Promise<Playlist[] | null> {
         if (Array.isArray(payload)) {
-            return this.normalizePlaylists(payload)
+            return await this.normalizePlaylists(payload)
         }
 
         if (payload && typeof payload === 'object') {
@@ -836,12 +842,50 @@ export class ScreenliteAdapter implements CMSAdapter, PairableCMSAdapter {
             const candidate = body.playlists ?? body.schedule?.playlists ?? body.data?.playlists
 
             if (Array.isArray(candidate)) {
-                return this.normalizePlaylists(candidate)
+                return await this.normalizePlaylists(candidate)
             }
         }
 
         console.warn('ScreenliteAdapter: Unexpected schedule payload shape', payload)
         return null
+    }
+
+    private async resolveItemTemplateLayout(item: any): Promise<PlayerTemplateLayoutDto | null> {
+        try {
+            const asLayout = item?.template_layout ?? item?.templateLayout ?? null
+
+            if (asLayout && typeof asLayout === 'object') {
+                return asLayout as PlayerTemplateLayoutDto
+            }
+
+            const templateId = String(item?.templateId ?? item?.template_id ?? item?.template ?? '').trim()
+
+            if (!templateId) return null
+
+            if (!this.token) {
+                this.updateStatus('waiting_for_pairing')
+                return null
+            }
+
+            const response = await this.apiClient.getTemplate(this.token, templateId)
+
+            if (response.unauthorized) {
+                console.warn('ScreenliteAdapter: Template fetch unauthorized, clearing device token')
+                this.handleUnauthorized()
+                return null
+            }
+
+            if (response.ok && response.data) {
+                // response.data may be PlayerTemplateDto or wrapper; try to extract layout
+                const data = response.data as any
+                return (data.layout ?? data.data?.layout) as PlayerTemplateLayoutDto | null
+            }
+
+            return null
+        } catch (err) {
+            console.warn('ScreenliteAdapter: Failed to resolve template layout for item', item, err)
+            return null
+        }
     }
 
     private extractTemplates(payload: PlayerTemplateResponse): PlayerTemplateDto[] | null {
@@ -873,7 +917,7 @@ export class ScreenliteAdapter implements CMSAdapter, PairableCMSAdapter {
             const screenId = String(rawTemplate.screenId ?? this.getLinkedScreenId() ?? 'unassigned-screen')
 
             const sections = layout.elements.map((element, elementIndex) => {
-                const normalized = this.normalizeTemplateElement(element)
+                const normalized = this.normalizeTemplateElement(element, layout)
 
                 return {
                     id: `${templateId}-section-${elementIndex}`,
@@ -917,19 +961,35 @@ export class ScreenliteAdapter implements CMSAdapter, PairableCMSAdapter {
         })
     }
 
-    private normalizeTemplateLayout(layout?: PlayerTemplateLayoutDto): Required<PlayerTemplateLayoutDto> {
+    private normalizeTemplateLayout(layout?: PlayerTemplateLayoutDto): {
+        width: number
+        height: number
+        background: string
+        backgroundColor: string
+        backgroundImageUrl: string
+        backgroundImageFit: 'cover' | 'contain' | 'fill'
+        elements: PlayerTemplateElementDto[]
+    } {
+        const baseWidth = Number(layout?.baseResolution?.width)
+        const baseHeight = Number(layout?.baseResolution?.height)
+        const width = Number.isFinite(baseWidth) ? baseWidth : Number(layout?.width ?? 1920)
+        const height = Number.isFinite(baseHeight) ? baseHeight : Number(layout?.height ?? 1080)
+
         return {
-            width: Number(layout?.width ?? 1920),
-            height: Number(layout?.height ?? 1080),
+            width,
+            height,
             background: String(layout?.background ?? '#000000'),
-            backgroundColor: layout?.backgroundColor,
-            backgroundImageUrl: layout?.backgroundImageUrl,
-            backgroundImageFit: layout?.backgroundImageFit,
+            backgroundColor: String(layout?.backgroundColor ?? '#000000'),
+            backgroundImageUrl: String(layout?.backgroundImageUrl ?? ''),
+            backgroundImageFit: layout?.backgroundImageFit ?? 'contain',
             elements: Array.isArray(layout?.elements) ? layout.elements : [],
         }
     }
 
-    private normalizeTemplateElement(element: PlayerTemplateElementDto): {
+    private normalizeTemplateElement(
+        element: PlayerTemplateElementDto,
+        layout: ReturnType<typeof this.normalizeTemplateLayout>,
+    ): {
         x: number
         y: number
         width: number
@@ -972,6 +1032,7 @@ export class ScreenliteAdapter implements CMSAdapter, PairableCMSAdapter {
         const textPayload = {
             text: String(element.text ?? ''),
             style: element.style ?? {},
+            baseResolution: { width: layout.width, height: layout.height },
         }
 
         return {
@@ -1014,11 +1075,57 @@ export class ScreenliteAdapter implements CMSAdapter, PairableCMSAdapter {
         this.callback?.(playlists)
     }
 
-    private normalizePlaylists(rawPlaylists: PlayerPlaylistDto[]): Playlist[] {
-        return rawPlaylists.map((raw, index) => {
+    private async normalizePlaylists(rawPlaylists: PlayerPlaylistDto[]): Promise<Playlist[]> {
+        const out: Playlist[] = []
+
+        for (let index = 0; index < rawPlaylists.length; index++) {
+            const raw = rawPlaylists[index]
             const value = raw ?? ({} as PlayerPlaylistDto)
 
-            return {
+            const sections: Playlist['sections'] = Array.isArray(value.sections)
+                ? (await Promise.all((value.sections as PlayerScheduleSectionDto[]).map(async section => {
+                      const sec = section ?? ({} as PlayerScheduleSectionDto)
+
+                      const items = Array.isArray(sec.items)
+                          ? await Promise.all(
+                                sec.items.map(async it => {
+                                    const item = it ?? ({} as any)
+
+                                    if (String(item.content_type ?? '').toLowerCase() === 'template') {
+                                        const layout = await this.resolveItemTemplateLayout(item)
+
+                                        if (layout) {
+                                            // embed layout into content_path as JSON so renderers can pick it up
+                                            return {
+                                                id: String(item.id ?? `template-item-${Date.now()}`),
+                                                content_type: 'template',
+                                                content_path: JSON.stringify({ template_layout: layout }),
+                                                duration: Number(item.duration ?? 10) * 60,
+                                                objectFit: (item as any).objectFit,
+                                            }
+                                        }
+                                    }
+
+                                    return {
+                                        id: String(item.id ?? `item-${Date.now()}`),
+                                        content_type: String(item.content_type ?? ''),
+                                        content_path: String(item.content_path ?? ''),
+                                        duration: Number(item.duration ?? 10) * 60,
+                                        objectFit: (item as any).objectFit,
+                                    }
+                                }),
+                            )
+                          : []
+
+                      return {
+                          id: String(sec.id ?? `section-${Date.now()}`),
+                          position: sec.position as any,
+                          items,
+                      }
+                  })))
+                : []
+
+            out.push({
                 id: String(value.id ?? `playlist-${index}`),
                 start_date: String(value.start_date ?? '2000-01-01'),
                 end_date: String(value.end_date ?? '2099-12-31'),
@@ -1030,9 +1137,11 @@ export class ScreenliteAdapter implements CMSAdapter, PairableCMSAdapter {
                 backgroundColor: (value as any)?.backgroundColor,
                 backgroundImageUrl: (value as any)?.backgroundImageUrl,
                 backgroundImageFit: (value as any)?.backgroundImageFit,
-                sections: Array.isArray(value.sections) ? (value.sections as Playlist['sections']) : [],
-            }
-        })
+                sections,
+            })
+        }
+
+        return out
     }
 
     private extractPairPayload(payload: PlayerPairConsumeResponse | null): {

@@ -15,6 +15,27 @@ function pctOrNull(v: number | undefined): number | null {
 	return v
 }
 
+type SurfaceSize = {
+	width: number
+	height: number
+}
+
+function toFiniteNumber(value: unknown): number | null {
+	if (typeof value !== 'number' || !Number.isFinite(value)) {
+		return null
+	}
+
+	return value
+}
+
+function getScale(referenceSize: number | null, renderSize: number): number {
+	if (referenceSize && referenceSize > 0) {
+		return renderSize / referenceSize
+	}
+
+	return 1
+}
+
 /**
  * Resolved rectangle dimensions in pixels
  */
@@ -37,6 +58,13 @@ export type ElementWithPosition = {
 	yPct?: number
 	widthPct?: number
 	heightPct?: number
+}
+
+export type ResponsiveRect = {
+	x: number | null
+	y: number | null
+	width: number | null
+	height: number | null
 }
 
 /**
@@ -85,6 +113,64 @@ export function resolveRect(
 		width: Math.round((wp / 100) * viewportWidth),
 		height: Math.round((hp / 100) * viewportHeight),
 	}
+}
+
+/**
+ * Resolves template element geometry against the live render surface.
+ * Percentage coordinates win; legacy pixel coordinates scale from a reference size
+ * when one is available, otherwise they are used as-is.
+ */
+export function resolveResponsiveRect(
+	element: ElementWithPosition,
+	renderSize: SurfaceSize,
+	referenceSize?: Partial<SurfaceSize>,
+): ResponsiveRect {
+	const scaleX = getScale(toFiniteNumber(referenceSize?.width), renderSize.width)
+	const scaleY = getScale(toFiniteNumber(referenceSize?.height), renderSize.height)
+
+	const xPct = pctOrNull(element.xPct)
+	const yPct = pctOrNull(element.yPct)
+	const widthPct = pctOrNull(element.widthPct)
+	const heightPct = pctOrNull(element.heightPct)
+
+	return {
+		x: xPct !== null ? Math.round((xPct / 100) * renderSize.width) : (element.x !== undefined ? Math.round(element.x * scaleX) : null),
+		y: yPct !== null ? Math.round((yPct / 100) * renderSize.height) : (element.y !== undefined ? Math.round(element.y * scaleY) : null),
+		width: widthPct !== null ? Math.round((widthPct / 100) * renderSize.width) : (element.width !== undefined ? Math.round(element.width * scaleX) : null),
+		height: heightPct !== null ? Math.round((heightPct / 100) * renderSize.height) : (element.height !== undefined ? Math.round(element.height * scaleY) : null),
+	}
+}
+
+/**
+ * Scales a font size or other pixel length using the smaller axis scale.
+ */
+export function resolveResponsiveFontSize(
+	fontSize: unknown,
+	referenceSize: Partial<SurfaceSize> | undefined,
+	renderSize: SurfaceSize,
+): string | undefined {
+	const referenceWidth = toFiniteNumber(referenceSize?.width)
+	const referenceHeight = toFiniteNumber(referenceSize?.height)
+	const scaleX = getScale(referenceWidth, renderSize.width)
+	const scaleY = getScale(referenceHeight, renderSize.height)
+	const scale = Math.min(scaleX, scaleY)
+
+	if (typeof fontSize === 'number' && Number.isFinite(fontSize)) {
+		return `${Math.round(fontSize * scale)}px`
+	}
+
+	if (typeof fontSize === 'string') {
+		const trimmed = fontSize.trim()
+		const match = trimmed.match(/^(-?\d+(?:\.\d+)?)px$/i)
+
+		if (match) {
+			return `${Math.round(Number(match[1]) * scale)}px`
+		}
+
+		return trimmed
+	}
+
+	return undefined
 }
 
 /**

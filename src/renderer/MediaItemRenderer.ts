@@ -1,5 +1,6 @@
 import type { MediaItem } from '../types'
 import { runtimeClock } from '../services/runtimeClock'
+import { getBackgroundImageFitStyle, resolveResponsiveFontSize, resolveResponsiveRect } from '../utils/resolveRect'
 
 const ENABLE_PLAYBACK_TRACKER = import.meta.env.VITE_ENABLE_PLAYBACK_TRACKER === 'true'
 
@@ -51,6 +52,29 @@ export class MediaItemRenderer {
             }
             video.appendChild(source)
             this.el = video
+        } else if (item.type === 'template') {
+            const container = document.createElement('div')
+            container.style.position = 'absolute'
+            container.style.top = '0'
+            container.style.left = '0'
+            container.style.width = '100%'
+            container.style.height = '100%'
+            container.style.overflow = 'hidden'
+
+            // item.src is expected to be a JSON string with { template_layout: {...} }
+            try {
+                const parsed = JSON.parse(item.src || '{}') as any
+                const layout = parsed?.template_layout ?? parsed?.layout ?? null
+
+                if (layout) {
+                    this.renderTemplateLayout(container, layout)
+                }
+            } catch {
+                // ignore parse errors and fallback to empty container
+            }
+
+            this.lastTextPayload = item.src
+            this.el = container
         } else {
             const textBox = document.createElement('div')
 
@@ -84,6 +108,24 @@ export class MediaItemRenderer {
             (item.src !== this.lastTextPayload || (item.hidden !== prevHidden && !item.hidden))
         ) {
             this.applyTextPayload(this.el, item.src)
+        }
+
+        if (item.type === 'template' && item.src !== this.lastTextPayload && this.el instanceof HTMLElement) {
+            // re-render template content when payload changes
+            // recreate inner HTML
+            while (this.el.firstChild) this.el.removeChild(this.el.firstChild)
+            try {
+                const parsed = JSON.parse(item.src || '{}') as any
+                const layout = parsed?.template_layout ?? parsed?.layout ?? null
+
+                if (layout) {
+                    this.renderTemplateLayout(this.el, layout)
+                }
+            } catch {
+                // ignore
+            }
+
+            this.lastTextPayload = item.src
         }
 
         this.applyState(item)
@@ -139,13 +181,87 @@ export class MediaItemRenderer {
         this.onMediaError(this.itemId, error)
     }
 
-    private applyTextPayload(el: HTMLDivElement, src: string): void {
+    private renderTemplateLayout(container: HTMLElement, layout: any): void {
+        const renderSize = this.getRenderSurfaceSize()
+        const referenceSize = {
+            width: Number(layout?.baseResolution?.width ?? layout?.width ?? renderSize.width),
+            height: Number(layout?.baseResolution?.height ?? layout?.height ?? renderSize.height),
+        }
+
+        if (typeof layout.background === 'string') {
+            container.style.background = String(layout.background)
+        }
+
+        if (typeof layout.backgroundColor === 'string') {
+            container.style.backgroundColor = String(layout.backgroundColor)
+        }
+
+        if (typeof layout.backgroundImageUrl === 'string' && layout.backgroundImageUrl.trim() !== '') {
+            const fitStyle = getBackgroundImageFitStyle(layout.backgroundImageFit)
+
+            container.style.backgroundImage = `url(${String(layout.backgroundImageUrl)})`
+            container.style.backgroundSize = fitStyle.backgroundSize
+            container.style.backgroundPosition = 'center'
+            container.style.backgroundRepeat = 'no-repeat'
+        } else {
+            container.style.backgroundImage = 'none'
+        }
+
+        const elements = Array.isArray(layout.elements) ? layout.elements : []
+
+        for (const el of elements) {
+            const wrapper = document.createElement('div')
+            const rect = resolveResponsiveRect(el, renderSize, referenceSize)
+
+            wrapper.style.position = 'absolute'
+
+            if (rect.x !== null) wrapper.style.left = `${rect.x}px`
+            if (rect.y !== null) wrapper.style.top = `${rect.y}px`
+            if (rect.width !== null) wrapper.style.width = `${rect.width}px`
+            else wrapper.style.width = 'auto'
+            if (rect.height !== null) wrapper.style.height = `${rect.height}px`
+            else wrapper.style.height = 'auto'
+
+            const type = String(el.type ?? '').toLowerCase()
+
+            if (type === 'image' && typeof el.imageUrl === 'string') {
+                const img = document.createElement('img')
+                img.src = String(el.imageUrl)
+                img.style.width = '100%'
+                img.style.height = '100%'
+                img.style.objectFit = String(el.objectFit ?? 'cover')
+                img.onerror = () => this.reportError('template element image failed to load')
+                wrapper.appendChild(img)
+            } else {
+                const textPayload = JSON.stringify({ text: String(el.text ?? ''), style: el.style ?? {} })
+                this.applyTextPayload(wrapper, textPayload, referenceSize, renderSize)
+            }
+
+            container.appendChild(wrapper)
+        }
+    }
+
+    private getRenderSurfaceSize(): { width: number; height: number } {
+        const width = window.innerWidth || document.documentElement.clientWidth || window.screen.width || 0
+        const height = window.innerHeight || document.documentElement.clientHeight || window.screen.height || 0
+
+        return {
+            width: width > 0 ? width : 1920,
+            height: height > 0 ? height : 1080,
+        }
+    }
+
+    private applyTextPayload(el: HTMLDivElement, src: string, referenceSize?: { width: number; height: number }, renderSize?: { width: number; height: number }): void {
         this.cleanupDynamicText()
         this.lastTextPayload = src
 
         type TextPayload = {
             text?: string
             style?: Record<string, unknown>
+            baseResolution?: {
+                width?: number
+                height?: number
+            }
         }
 
         let payload: TextPayload = { text: src }
@@ -163,17 +279,27 @@ export class MediaItemRenderer {
         const style = payload.style ?? {}
         const rawText = String(payload.text ?? '')
         const widgetKind = String(style.widgetKind ?? '').toLowerCase()
+        const effectiveRenderSize = renderSize ?? this.getRenderSurfaceSize()
+        const effectiveReferenceSize = payload.baseResolution ?? referenceSize
+        const fontSize = resolveResponsiveFontSize(style.fontSize ?? 32, effectiveReferenceSize, effectiveRenderSize) ?? '32px'
+                const textAlign = typeof style.textAlign === 'string' ? style.textAlign : 'center'
+                const fontWeight =
+                        typeof style.fontWeight === 'number'
+                                ? String(style.fontWeight)
+                                : typeof style.fontWeight === 'string'
+                                    ? style.fontWeight
+                                    : '700'
 
         el.style.display = 'flex'
         el.style.alignItems = 'center'
-        el.style.justifyContent = 'center'
-        el.style.padding = '8px'
+                el.style.justifyContent = 'center'
+                el.style.padding = '8px'
         el.style.boxSizing = 'border-box'
         el.style.whiteSpace = 'pre-wrap'
-        el.style.wordBreak = 'break-word'
-        el.style.textAlign = typeof style.textAlign === 'string' ? style.textAlign : 'center'
-        el.style.fontSize = typeof style.fontSize === 'string' ? style.fontSize : '32px'
-        el.style.fontWeight = typeof style.fontWeight === 'string' ? style.fontWeight : '700'
+                el.style.wordBreak = 'break-word'
+                el.style.textAlign = textAlign
+                el.style.fontSize = fontSize
+                el.style.fontWeight = fontWeight
         el.style.color = typeof style.color === 'string' ? style.color : '#FFFFFF'
         if (typeof style.background === 'string') {
             el.style.background = style.background

@@ -65,6 +65,20 @@ export class ScreenlitePlayerApiClient {
         })
     }
 
+    getTemplate(
+        deviceToken: string,
+        templateId: string,
+    ): Promise<ScreenliteApiResult<PlayerTemplateResponse | unknown>> {
+        const endpoint = `/api/templates/${encodeURIComponent(String(templateId))}`
+
+        return this.fetchJson(endpoint, {
+            method: 'GET',
+            headers: {
+                'X-Device-Token': deviceToken,
+            },
+        })
+    }
+
     getCompiledPlaylist(
         deviceToken: string,
         deviceId: string | undefined,
